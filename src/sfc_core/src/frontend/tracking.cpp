@@ -1763,10 +1763,12 @@ bool Tracking::relocalization() {
     bool reloc_ok = false;
     Pose best_pose;
     int best_inliers = 0, best_matches = 0;
-    int best_kf_id = -1;  // ★★★ 用 frame_id 代替指针（避免 dangling pointer）★★★
+    int best_kf_id = -1;  // 用 frame_id 代替指针（避免 dangling pointer）
+    // 失败路径也必须留下数字，否则只知道"没过"，不知道卡在匹配还是内点率
+    int n_cand = 0, n_short_raw = 0, n_pnp = 0, max_inl = 0;
+    double max_ratio = 0.0;
 
-    // ★★★ ORB-SLAM3 策略：遍历局部关键帧 + BoW 全局候选关键帧 ★★★
-    // 合并两个候选池，统一处理
+    // 局部关键帧 + BoW 全局候选合并成一个池，统一按同一套门槛检验
     std::vector<const KeyFrameCacheEntry*> all_candidate_ptrs;
     all_candidate_ptrs.reserve(mvpLocalKeyFrames_.size() + bow_candidates.size());
     for (const auto& kf : mvpLocalKeyFrames_)
@@ -1776,6 +1778,7 @@ bool Tracking::relocalization() {
 
     for (const KeyFrameCacheEntry* p_ref_kf : all_candidate_ptrs) {
         const auto& ref_kf = *p_ref_kf;
+        ++n_cand;
         std::vector<cv::DMatch> raw, inliers;
         
         // 投影匹配优先（先验可信时几何一致性高），否则 BoW 绝对匹配。
@@ -1814,10 +1817,9 @@ bool Tracking::relocalization() {
         
         const auto& ref_kps = (!ref_kf.undistorted_keypoints.empty())
             ? ref_kf.undistorted_keypoints : ref_kf.keypoints;
-        if (raw.size() < RELOC_MIN_RAW_MATCHES) continue;
+        if (raw.size() < RELOC_MIN_RAW_MATCHES) { ++n_short_raw; continue; }
 
-        // ★★★ 几何过滤：用 5 点法 RANSAC 估计本质矩阵，筛选极线一致性匹配 ★★★
-        // ★★★ 放宽到 10 个匹配（更激进地尝试重定位）★★★
+        // 5 点法 RANSAC 只保留极线一致的匹配；少于 10 条不足以约束本质矩阵。
         std::vector<cv::Point2f> pts1_norm, pts2_norm;
         std::vector<int> raw_idx_for_norm;
         CameraParams cam = getCameraParams(config_.K);
@@ -1922,7 +1924,8 @@ bool Tracking::relocalization() {
         // 钻到地面以下的解，这里只拦明显不可能的负值。
         const bool valid_z = pose.t.z() > MIN_RELOC_CAMERA_Z;
 
-        // ★★★ Bug Fix: 详细诊断日志 ★★★
+        ++n_pnp; max_inl = std::max(max_inl, result.inliers); max_ratio = std::max(max_ratio, inlier_ratio);
+
         if (config_.verbose_diag) {
             std::cerr << "[Reloc-PnP] ref_kf=" << ref_kf.frame_id
                       << " pts3d=" << pts3d.size() << " init_t=(" << std::fixed << std::setprecision(3)
@@ -1957,14 +1960,8 @@ bool Tracking::relocalization() {
             best_kf_id = ref_kf.frame_id;
         }
 
-        // ★★★ ORB-SLAM3 渐进式搜索：当第一次 PnP 结果不够好时 ★★★
-        // ORB-SLAM3 Relocalization():
-        //   if(nGood<50) { 宽窗口搜索 + PoseOptimization }
-        //   if(nGood>30 && nGood<50) { 窄窗口搜索 + PoseOptimization }
-        // 作用：当 BoW 匹配不够好时，通过投影搜索找到更多匹配来验证位姿
-        // 渐进式复核的触发门槛：首轮 PnP 至少给出若干个几何一致的内点，
-        // 才值得扩大搜索窗口补匹配。注意这只是"是否再试一次"的触发条件，
-        // 真正的接受门槛在下方的 result_wide 判定里，与主路径同源（reloc_min_*）。
+        // 首轮 PnP 有若干几何一致内点时，展开宽窗口补匹配再解一次（ORB-SLAM3 渐进式）。
+        // 这只是"是否再试"的触发条件，接受门槛在下方 result_wide，与主路径同源。
         constexpr int PROGRESSIVE_RETRY_MIN_INLIERS = 10;
         if (!reloc_ok && result.success && result.inliers >= PROGRESSIVE_RETRY_MIN_INLIERS &&
             result.inliers < 50 && valid_z) {
@@ -2081,12 +2078,13 @@ bool Tracking::relocalization() {
 
     if (!reloc_ok) {
         mnRelocConsecutiveFailures_++;
-        if (config_.verbose_diag) {
-            std::cerr << "[Reloc] f=" << mCurrentFrame_->id
-                      << " FAILED: best_inliers=" << best_inliers
-                      << " (need >= reloc_min_inliers=" << reloc_min_inliers << ")"
-                      << " total_consecutive_fail=" << mnRelocConsecutiveFailures_ << std::endl;
-        }
+        // 无条件打印：位姿冻结时只有这一行能说明卡在"凑不够匹配"还是"内点/内点率不达标"。
+        std::cerr << "[Reloc-FAIL] f=" << mCurrentFrame_->id
+                  << " cand=" << n_cand << " short_raw=" << n_short_raw
+                  << " pnp=" << n_pnp << " best_inl=" << max_inl
+                  << " best_ratio=" << std::setprecision(3) << max_ratio
+                  << " need>=" << reloc_min_inliers << "/" << reloc_min_ratio
+                  << " consec=" << mnRelocConsecutiveFailures_ << std::endl;
         return false;
     }
 
@@ -2161,18 +2159,20 @@ bool Tracking::relocalization() {
                   << " (gate " << config_.reloc_assoc_reproj_px << " px)" << std::endl;
     }
 
-    // ★★★ Bug Fix: RELOC 后必须将 best_pose 应用到当前帧 ★★★
-    // 原问题：relocalization() 计算了 best_pose 但忘记赋值给 mCurrentFrame_->pose。
-    // 导致：(1) updateWorldPoints() 用错误的 pose 计算世界坐标点；(2) 保存的
-    // keyframe entry.world_pose 是错误的；(3) 下一帧的 trackReferenceKeyFrame()
-    // 用错误的 pose 初始化；(4) 累积误差导致轨迹爆炸式漂移。
-    // 这就是为什么路径总长 135m 而实际场景只有 ~12m 的根本原因！
+    // RELOC 后必须把 best_pose 应用到当前帧：updateWorldPoints() 与写入
+    // mAllKeyFrames_ 的 world_pose 都读它，漏了就会把整段轨迹带偏。
     mCurrentFrame_->pose = best_pose;
 
     updateWorldPoints(mCurrentFrame_);
 
     mnMatchesInliers_ = best_inliers;
     last_inlier_count_ = mnMatchesInliers_;
+    // 恢复瞬间的位移量：区分"reloc 解错"与"冻结位姿本身就错了"（后者才是真跳变）。
+    const double reloc_jump = mLastFrame_ ? (best_pose.t - mLastFrame_->pose.t).norm() : 0.0;
+    std::cerr << "[Reloc-OK] f=" << mCurrentFrame_->id << " inl=" << best_inliers
+              << " ratio=" << std::setprecision(3)
+              << (best_matches > 0 ? static_cast<double>(best_inliers) / best_matches : 0.0)
+              << " jump=" << reloc_jump << " m" << std::endl;
 
     {
         KeyFrameCacheEntry entry;
