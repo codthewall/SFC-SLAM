@@ -33,6 +33,7 @@
 // 项目自身头文件
 #include "sfc_core/frontend/frame.hpp"
 #include "sfc_core/frontend/tracking.hpp"
+#include "sfc_core/frontend/depth_filter.hpp"
 #include "sfc_core/frontend/keyframe_policy.hpp"
 #include "sfc_core/frontend/robust_pnp_solver.hpp"
 #include "sfc_core/feature/octree_orb.hpp"
@@ -230,12 +231,9 @@ constexpr double RELOC_MAX_DELTA_T = 3.0;
 // 这里只做"明显钻到地下"的粗筛，不约束正常高度波动。
 constexpr double MIN_RELOC_CAMERA_Z = -2.0;
 
-// 帧间位姿跳变上限。poseOptimization 只能校验"优化结果 vs 本帧初值"，
-// 初值本身错了它看不出来；这一层拿优化结果和上一帧的真实位姿比。
-// 依据：TUM RGB-D 手持序列 30Hz，单帧平移 3–7cm、转角 <10°（0.17rad）。
-// 这里取 0.5m / 0.52rad（30°），留约一个数量级的余量，只拦"明显不是单帧运动"的解。
-constexpr double FRAME_JUMP_MAX_TRANSLATION_M = 0.5;
-constexpr double FRAME_JUMP_MAX_ROTATION_RAD = 0.524;
+// 帧间位姿跳变上限由 config_.frame_jump_max_translation / frame_jump_max_rotation
+// 提供（默认 0.15 m / 0.26 rad）。原实现把 0.5 m / 0.524 rad 硬编码在这里，
+// 对 TUM fr1（真实单帧位移 1~5 cm）等于没有守卫，实测 0.135 m 的瞬移被直接放行。
 
 // 单次回环修正里，单个关键帧位姿允许被移动的最大距离（米）。
 // PGO 是全局优化，修正几十厘米到几米都正常；超过这个量级说明回环边本身错了
@@ -475,8 +473,8 @@ void Tracking::compute3DPoints(Frame::Ptr frame, const cv::Mat& imDepth) {
     double fx = cam.fx, fy = cam.fy, cx = cam.cx, cy = cam.cy;
 
     const int rows = imDepth.rows, cols = imDepth.cols;
-    const int depth_type = imDepth.depth();
-    const bool is_32fc1 = (depth_type == CV_32F);
+    // 深度图在 track() 的 Step 2 已统一换算成 CV_32FC1（米），这里不再分整数/浮点。
+    const bool depth_is_float = (!imDepth.empty() && imDepth.type() == CV_32FC1);
 
     // R3：采样深度与反投影必须用两套不同的坐标，这是本节的核心。
     //   采样：深度图与 _畸变_ RGB 对齐（TUM RGB-D 等），必须用畸变像素 kp.pt；
@@ -489,25 +487,13 @@ void Tracking::compute3DPoints(Frame::Ptr frame, const cv::Mat& imDepth) {
     const auto& sample_kpts = frame->keypoints;
     for (size_t i = 0; i < sample_kpts.size(); ++i) {
         const auto& kp_sample = sample_kpts[i];
-        int u = cvRound(kp_sample.pt.x), v = cvRound(kp_sample.pt.y);
-        if (u < 0 || u >= cols || v < 0 || v >= rows) {
-            frame->depth_valid.push_back(false);
-            frame->pts_3d.emplace_back(0, 0, 0);
-            continue;
-        }
-        double depth;
-        if (is_32fc1) {
-            depth = imDepth.at<float>(v, u);
-        } else {
-            depth = imDepth.at<uint16_t>(v, u) * config_.depth_scale;
-        }
-        
-        if (std::isnan(depth) || std::isinf(depth)) {
-            frame->depth_valid.push_back(false);
-            frame->pts_3d.emplace_back(0, 0, 0);
-            continue;
-        }
-        if (depth <= config_.min_depth || depth > config_.max_depth) {
+        const int u = cvRound(kp_sample.pt.x), v = cvRound(kp_sample.pt.y);
+        const bool inside = (u >= 0 && u < cols && v >= 0 && v < rows);
+        const double depth = (inside && depth_is_float) ? static_cast<double>(imDepth.at<float>(v, u)) : 0.0;
+        // 一处判完：像素在图内、深度有限、落在 [min_depth, max_depth]、
+        // 且不落在深度不连续处（depth_edge_thresh 的消费者，见 depth_filter.hpp）。
+        if (!inside || !isValidDepthSample(imDepth, u, v, depth, config_.min_depth,
+                                          config_.max_depth, config_.depth_edge_thresh)) {
             frame->depth_valid.push_back(false);
             frame->pts_3d.emplace_back(0, 0, 0);
             continue;
@@ -870,13 +856,13 @@ Pose Tracking::track(const cv::Mat& rgb_img,
             Eigen::Quaterniond q_l = mLastFrame_->pose.q;
             if (q_c.coeffs().dot(q_l.coeffs()) < 0.0) q_c.coeffs() = -q_c.coeffs();
             const double frame_rot = Eigen::AngleAxisd(q_c * q_l.inverse()).angle();
-            if (frame_t > FRAME_JUMP_MAX_TRANSLATION_M ||
-                frame_rot > FRAME_JUMP_MAX_ROTATION_RAD) {
+            if (frame_t > config_.frame_jump_max_translation ||
+                frame_rot > config_.frame_jump_max_rotation) {
                 if (config_.verbose_diag) {
                     std::cerr << "[Track] f=" << mCurrentFrame_->id
                               << " 帧间跳变过大 t=" << frame_t << "m rot=" << frame_rot
-                              << "rad (上限 " << FRAME_JUMP_MAX_TRANSLATION_M << "m / "
-                              << FRAME_JUMP_MAX_ROTATION_RAD << "rad) → 判为跟踪失败"
+                              << "rad (上限 " << config_.frame_jump_max_translation << "m / "
+                              << config_.frame_jump_max_rotation << "rad) → 判为跟踪失败"
                               << std::endl;
                 }
                 nGood = 0;
@@ -940,7 +926,7 @@ Pose Tracking::track(const cv::Mat& rgb_img,
     if (is_keyframe && loop_detector_) {
         // D1-d：写回前的快照。PGO 一次性改四类状态（mAllKeyFrames_ 位姿、
         // mvpLocalKeyFrames_ 副本、后端 KeyFrame、回环库位姿），外加当前帧与
-        // mLastFrame_。一旦写回后当前帧相对写回前跳变超过 FRAME_JUMP_MAX_*，
+        // mLastFrame_。一旦写回后当前帧相对写回前跳变超过 frame_jump_max_*，
         // 说明这条回环边把本帧拽到了物理上不可能的位置——整次写回必须撤回：
         // 只退当前帧会让关键帧与当前帧位姿互相矛盾，比不回滚更糟。
         const Pose pose_before_loop = mCurrentFrame_->pose;
@@ -957,12 +943,13 @@ Pose Tracking::track(const cv::Mat& rgb_img,
             if (q_after.coeffs().dot(q_before.coeffs()) < 0.0) q_after.coeffs() = -q_after.coeffs();
             const double loop_t = (mCurrentFrame_->pose.t - pose_before_loop.t).norm();
             const double loop_rot = Eigen::AngleAxisd(q_after * q_before.inverse()).angle();
-            if (loop_t > FRAME_JUMP_MAX_TRANSLATION_M || loop_rot > FRAME_JUMP_MAX_ROTATION_RAD) {
+            if (loop_t > config_.frame_jump_max_translation ||
+                loop_rot > config_.frame_jump_max_rotation) {
                 // 错误日志不受 verbose_diag 控制：这是一次真实的"回环被判为不可信"，
                 // 需要和 mnDetectedLoops_ 的计数一起出现在默认日志里。
                 std::cerr << "[Loop] 写回后跳变过大 t=" << loop_t << "m rot=" << loop_rot
-                          << "rad (上限 " << FRAME_JUMP_MAX_TRANSLATION_M << "m / "
-                          << FRAME_JUMP_MAX_ROTATION_RAD << "rad)，回滚本次回环写回"
+                          << "rad (上限 " << config_.frame_jump_max_translation << "m / "
+                          << config_.frame_jump_max_rotation << "rad)，回滚本次回环写回"
                           << std::endl;
                 for (const auto& kv : kf_poses_before_loop) {
                     auto all_it = mAllKeyFrames_.find(kv.first);
@@ -2355,9 +2342,20 @@ void Tracking::searchLocalPoints() {
     CameraParams cam = getCameraParams(K);
     double fx = cam.fx, fy = cam.fy, cx = cam.cx, cy = cam.cy;
 
+    // ★ 关键帧永久点优先于上一帧的临时点 ★
+    // searchByProjection(当前帧, 上一帧) 会先把上一帧的临时点贴到当前帧的关键点上。
+    // 那些点是用"上一帧的位姿 + 上一帧的深度"现建的，拿它们做位姿优化等于每一步都
+    // 站在上一步的误差上：上一帧偏 1.5 cm，这一帧就再偏 1.5 cm，误差按帧串成链。
+    // 实测正是这个链条让每帧平移比真值快约 1.5 倍（整段路径 15.9 m 对真值 9.9 m）。
+    // 所以这里把"已匹配到临时点"的关键点留成候选，让关键帧的永久点有机会把它顶掉
+    // —— 位姿重新锚到更早、视差更大、更可信的观测上，链条就断了。
     std::vector<char> kpt_matched(curr_kpts.size(), 0);
-    for (size_t i = 0; i < mvpCurrentMapPointIds_.size(); ++i)
-        if (mvpCurrentMapPointIds_[i] >= 0) kpt_matched[i] = 1;
+    const size_t n_slots = std::min(mvpCurrentMapPointIds_.size(), curr_kpts.size());
+    for (size_t i = 0; i < n_slots; ++i) {
+        const int mp_id = mvpCurrentMapPointIds_[i];
+        if (mp_id < 0) continue;
+        if (mTemporalMapPoints_.count(mp_id) == 0) kpt_matched[i] = 1;
+    }
 
     int search_count = 0;
     const int max_search = 500;

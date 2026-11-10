@@ -363,6 +363,10 @@ loadTrackingConfig(const std::string& yaml_path) {
     cfg.min_depth = getDouble(fs, "min_depth", cfg.min_depth);
     cfg.max_depth = getDouble(fs, "max_depth", cfg.max_depth);
     cfg.depth_edge_thresh = getDouble(fs, "depth_edge_thresh", cfg.depth_edge_thresh);
+    cfg.frame_jump_max_translation =
+        getDouble(fs, "frame_jump_max_translation", cfg.frame_jump_max_translation);
+    cfg.frame_jump_max_rotation =
+        getDouble(fs, "frame_jump_max_rotation", cfg.frame_jump_max_rotation);
 
     // 注：extractor_config / matcher_config 故意不在这里读。
     // 它们的唯一来源分别是 feature_extractor.yaml 与 feature_matcher.yaml，

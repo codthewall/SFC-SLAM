@@ -139,6 +139,7 @@ add_library(${PROJECT_NAME} SHARED
   src/frontend/covis_manager.cpp
   src/frontend/tracking.cpp
   src/frontend/keyframe_policy.cpp
+  src/frontend/depth_filter.cpp
   src/frontend/frame.cpp
   src/frontend/sophus_pose_adapter.cpp
   src/feature/bow_adapter.cpp
@@ -189,6 +190,19 @@ target_link_libraries(test_keyframe_policy
 )
 target_compile_options(test_keyframe_policy PRIVATE -Usfc_core)
 install(TARGETS test_keyframe_policy
+  DESTINATION lib/${PROJECT_NAME}
+)
+
+# 测试可执行程序：深度采样有效性 / 深度边缘过滤单测（纯计算，不需要相机数据）
+add_executable(test_depth_filter
+  test/test_depth_filter.cpp
+)
+target_link_libraries(test_depth_filter
+  ${PROJECT_NAME}
+  ${OpenCV_LIBS}
+)
+target_compile_options(test_depth_filter PRIVATE -Usfc_core)
+install(TARGETS test_depth_filter
   DESTINATION lib/${PROJECT_NAME}
 )
 

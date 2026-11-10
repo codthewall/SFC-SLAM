@@ -595,7 +595,7 @@ int main(int argc, char** argv) {
     if (tcfg.disable_undistort && !tcfg.D.empty()) {
         std::cerr << "[main] 警告: " << args.config_dir
                   << "/tracking.yaml 的 disable_undistort=true 但 D 非空（fr1 有强畸变）。"
-                  << "畸变会被静默忽略，建议改成 false。\n";
+                  << "tracking 会忽略该开关并强制去畸变；建议把 yaml 改成 false 以免误导。\n";
     }
     tcfg.verbose_diag = args.verbose;
 

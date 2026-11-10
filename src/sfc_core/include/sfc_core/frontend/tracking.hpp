@@ -48,6 +48,12 @@ struct TrackingConfig {
     double max_depth = 10.0;
     double depth_edge_thresh = 0.25;
 
+    // ---------------- 帧间跳变守卫 ----------------
+    // 原硬编码 0.5 m / 0.524 rad，对 fr1 的真实单帧位移 1~5 cm 等于没有守卫。
+    // 拿优化结果与上一帧真实位姿比，只拦"明显不是单帧运动"的解；取真实上限约 3 倍。
+    double frame_jump_max_translation = 0.15;
+    double frame_jump_max_rotation = 0.26;
+
     double min_keyframe_translation = 0.05;
     double min_keyframe_rotation = 0.05;
     int min_features = 50;
