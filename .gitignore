@@ -1,0 +1,45 @@
+# ── 构建产物 ─────────────────────────────────────────────
+build/
+build_*/
+cmake-build-*/
+devel/
+install/
+log/
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+compile_commands.json
+Makefile
+*.o
+*.obj
+*.so
+*.so.*
+*.a
+*.lib
+*.dll
+*.exe
+*.pdb
+
+# ── 词袋与数据集（体积过大，按 README 说明单独下载）────
+ORBvoc.txt
+orb_vocab*.txt
+*.bag
+*.db3
+*.mcap
+
+# ── 运行期诊断/评测输出 ─────────────────────────────────
+diag_log*.*
+*.log
+CameraTrajectory*.txt
+KeyFrameTrajectory*.txt
+frame_trajectory*.txt
+
+# ── Python / 编辑器 ────────────────────────────────────
+__pycache__/
+*.pyc
+.venv/
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db

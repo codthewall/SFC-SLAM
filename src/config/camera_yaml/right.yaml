@@ -1,0 +1,31 @@
+%YAML:1.0
+# TUM freiburg2 RGB 相机标定
+# 来源：http://vision.in.tum.de/data/datasets/rgbd-dataset/tools#calibration
+# freiburg2: fx=520.9, fy=521.0, cx=325.1, cy=249.7
+# 注意：原文件用的是 freiburg1 值，此处已更正为 freiburg2
+image_width: 640
+image_height: 480
+camera_name: rgb_camera
+camera_matrix:
+  rows: 3
+  cols: 3
+  data: [520.9,   0.0,   325.1,
+           0.0,   521.0, 249.7,
+           0.0,   0.0,   1.0]
+distortion_model: plumb_bob
+distortion_coefficients:
+  rows: 1
+  cols: 5
+  data: [0.2312, -0.7849, -0.0033, -0.0001, 0.9172]
+rectification_matrix:
+  rows: 3
+  cols: 3
+  data: [ 0.96201663, -0.00858457, -0.27285585,
+          0.0084728 ,  0.99996284, -0.00158794,
+          0.27285935, -0.00078423,  0.96205362]
+projection_matrix:
+  rows: 3
+  cols: 4
+  data: [674.31284,   0.     , 544.88397, -16.89048,
+           0.     , 674.31284, 277.66934,   0.     ,
+           0.     ,   0.     ,   1.     ,   0.     ]

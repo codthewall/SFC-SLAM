@@ -1,0 +1,51 @@
+%YAML 1.0
+# ================================================================
+# Feature Extractor 配置文件
+# 文件路径: config/feature_extractor.yaml
+# 模块: 特征提取 - Octree ORB（ORB_SLAM3 风格）
+# 加载: sfc_core::config::loadOctreeORBConfig()
+# ================================================================
+#
+# 说明：
+#   本文件是 OctreeORBConfig 的唯一来源。
+#   历史问题：loader 曾去读一个不存在的 octree_orb.yaml，每次启动 WARNING 后
+#   静默使用结构体默认值，这里写的参数从未生效（R-019 反例）。
+#   现已修正为读本文件。
+#
+# 关于已删除的键：
+#   enable_uniform / grid_cols / grid_rows / max_per_grid
+#   这四个键没有任何 C++ 消费点——OctreeORBConfig 里不存在对应字段。
+#   本实现用的是 ORB-SLAM3 的四叉树划分（ExtractorNode），不是均匀网格，
+#   写这些键只会让人以为可以调网格密度。已删除。
+# ================================================================
+
+# 每帧提取的特征点总数（跨所有金字塔层分配）。
+# 建议值：
+#   - 实时 SLAM（嵌入式/移动端）：800-1200
+#   - 桌面/服务器：1500-2000
+#   - 高精度离线处理：2000-3000
+n_features: 1500
+
+# 金字塔尺度因子。经典 ORB-SLAM 参数。
+scale_factor: 1.2
+
+# 金字塔层数。经典 ORB-SLAM 参数。
+n_levels: 8
+
+# FAST 角点初始检测阈值（第一层）。
+# 值越小检测到的角点越多，误检也越多。
+# TUM RGB-D 数据集建议 15-20。
+ini_threshold_fast: 15
+
+# FAST 角点最小阈值（逐层递减到此值，ORB-SLAM3 的 minThFAST）。
+# 首轮提取数量不足时，会用此阈值再补一轮。
+min_threshold_fast: 7
+
+# 边缘阈值：特征点距图像边缘的最小距离（像素）。
+# 约束：必须 >= patch_size / 2 + 1，否则边界处的描述子会越界采样。
+# ORB_SLAM3 标准值 19（patch_size=31 时 31/2+1 = 16，19 > 16 安全）。
+edge_threshold: 19
+
+# 描述子 patch 大小（像素，必须为奇数）。
+# ORB_SLAM3 标准值 31。
+patch_size: 31

@@ -1,0 +1,147 @@
+%YAML 1.0
+# ================================================================
+# Geometric Verifier 配置文件
+# 文件路径: config/geometric_verifier.yaml
+# 模块: 回环检测 - 几何验证（Essential Matrix / ICP 3D-3D / Homography）
+# ================================================================
+#
+# 功能说明：
+#   几何验证器通过 RANSAC 估计 Essential Matrix / ICP 3D-3D 对齐 / Homography
+#   来验证两帧之间的几何一致性，过滤误检的回环候选。
+#
+# 验证方法优先级（LoopDetector.cpp 决定）：
+#   1. ICP 3D-3D（RGB-D 首选，有真实尺度）
+#   2. Essential Matrix（降级模式，无尺度，仅方向约束）
+#   3. Homography（平面场景备选）
+#
+# 调参指南：
+#   - 场景匹配数少（< 20）→ 降低 min_inliers / min_essential_inliers
+#   - 误检率高（正常场景拒绝）→ 提高 min_inlier_ratio / min_essential_inlier_ratio
+#   - ICP 永远失败（0 valid 3D matches）→ 降低 min_icp_inliers / 扩大 min_depth
+#   - 退化场景（纯旋转/平面）→ 使用 Homography 验证方法
+#
+# ================================================================
+
+# ---------- RANSAC 通用参数 ----------
+# RANSAC 迭代次数。迭代越多越可能找到正确解，但计算量也越大。
+# 室内场景（匹配数 5-15）建议 200-500；户外（匹配数 > 50）可用 200。
+ransac_iterations: 200
+
+# 像素阈值：RANSAC 内点判断阈值（像素）。值越大越宽松，内点越多。
+# 室内近距离（< 5m）：4-6px；户外远距离（> 10m）：8-12px。
+# 注意：此阈值影响 Essential Matrix 和 Homography，不影响 ICP（见 icp_reproj_thresh_px）
+threshold_px: 4.0
+
+
+# ---------- Essential Matrix 验证参数 ----------
+# Essential Matrix 几何验证的最低内点数量。
+# 5 个点是最小求解阈值；建议 ≥ 4 以保证恢复位姿的可靠性。
+# 若回环描述子匹配数通常只有 7-14 个，建议设置为 4-6。
+# 设置过高会导致所有候选失败（返回 -1）。
+# ★★★ 从 4 降低到 2 ★★★
+# 回环降级 Essential Matrix 只需 4 个点即可求解（5 点算法）。
+# 室内场景有效匹配对经常只有 2-4 个，过高的门槛导致所有候选失败。
+min_inliers: 12
+
+# Essential Matrix 验证的最低内点率（内点数 / 总匹配数）。
+# 低于此值的回环候选被拒绝。
+# 室内场景：0.20-0.35；户外宽基线：0.15-0.25。
+# 注意：回环降级模式下使用 min_essential_inlier_ratio（更严格）。
+# ★★★ 从 0.20 提高到 0.15 ★★★
+# 回环降级 Essential Matrix 需要更宽松的内点率。
+# 室内回环匹配数少（5-15 个），min_inlier_ratio 过高会导致所有回环在 EM 阶段被拒绝。
+# 配合 min_inliers=2，共同确保至少 2-3 个内点即可通过几何验证。
+min_inlier_ratio: 0.25
+
+
+# ---------- ICP 3D-3D 验证参数 ----------
+# ICP（3D-3D 点云对齐）专用参数。
+# ICP 提供带真实尺度的相对位姿，是 RGB-D 回环的首选方法。
+#
+# ICP 优势 vs Essential Matrix：
+#   - 有真实尺度约束（EM 只能得到归一化平移方向）
+#   - 室内场景 3D 点对应更稳定
+#
+# ICP 劣势：
+#   - 需要足够多的有效 3D 点对（受深度有效性影响）
+#   - 对尺度漂移敏感（回环时两帧深度可能已经漂移）
+
+# ICP RANSAC 最低内点数量（SVD 3D-3D 理论上只需 3 对即可求解）。
+# 设置过低会导致 ICP 结果不可靠；设置过高会导致 ICP 永远失败。
+# 建议值：2-4。室内回环匹配数 5-15，建议 2-3。
+# ★★★ 从 1 改为 2 ★★★
+# ICP 3D-3D 理论上 2 对就能给出约束，但 1 个内点没有统计意义。
+min_icp_inliers: 12
+
+# ICP 最低内点率（内点数 / 有效 3D 匹配数）。
+# 提高此值可过滤低质量 ICP 结果。
+# 建议值：0.20-0.30。室内回环场景 0.20 较合适。
+min_icp_inlier_ratio: 0.20
+
+# ICP 重投影误差阈值（像素）。用于判断 ICP 变换后的内点。
+# 值越大越宽松，内点越多。建议 20-30px（室内回环深度噪声大）。
+icp_reproj_thresh_px: 25.0
+
+# ICP 内点率上限（> 此值说明可能退化，拒绝 ICP）。
+# 退化场景：所有点都"对齐"了（内点率接近 100%），实际上是无效约束。
+# 典型退化场景：纯旋转、近似平面、所有点共面。
+# 建议值：0.80-0.90。正常室内场景 0.85 较合适。
+max_icp_inlier_ratio: 0.85
+
+
+# ---------- 回环 Essential Matrix 降级方案参数 ----------
+# 当 ICP 失败时，使用 Essential Matrix 作为降级方案。
+# EM 模式下没有真实尺度，只有归一化平移方向。
+# 这些参数比普通 EM 更严格，用于过滤低质量回环。
+#
+# 注意：EM 模式下 PGO 回环边的平移信息为 0（仅方向约束），
+# 真实尺度由里程计约束主导。因此 EM 回环的尺度校正能力有限。
+#
+# 调参策略：
+#   - 回环内点 5-7 个很常见 → min_essential_inliers 设为 4-6
+#   - 高内点率（> 60%）的 EM 比低内点率（< 50%）更可靠 → min_essential_inlier_ratio 不要设太低
+#   - ICP 成功率低时（0 valid 3D matches）→ 提高 EM 门槛来补偿
+
+# 回环 EM 验证的最低内点数。
+# 室内场景（匹配数少）：3-4。降低此值可接受更少的内点。
+min_essential_inliers: 3
+
+# 回环 EM 验证的最低内点率（内点数 / 总匹配数）。
+# 从 0.30 提高到 0.40，要求 EM 内点率至少 40%。
+# 室内场景（匹配数少）：0.35-0.45；户外（匹配数多）：0.25-0.35。
+min_essential_inlier_ratio: 0.40
+
+
+# ---------- Homography 验证参数（可选） ----------
+# Homography 验证用于平面场景或纯旋转场景。
+# Homography 比 Essential Matrix 更适合此类场景。
+# 注意：Homography 不能直接提供正确的相对位姿（旋转可能不准确），
+# 当前实现使用单位矩阵作为占位，建议在后续版本中改进。
+#
+# 建议：除非有明确的平面场景需求，否则保持禁用（通过 LoopDetector 调用）。
+
+
+# ---------- 3D 深度过滤参数（ICP 用） ----------
+# 深度过滤范围：超出范围的深度点不参与 ICP 计算。
+# 这些值影响 ICP 有效 3D 匹配数，从而影响 ICP 成功率。
+
+# 最小有效深度（米）。过近的点深度误差大。
+# ★ P0-1 回归：这里必须与 Tracking 的 min_depth 一致（0.1m）。
+#   本文件此前写 0.05，而 GeometricVerifierConfig 的结构体默认值是 0.1 并注明了
+#   "原值 0.05-30.0 与 Tracking 的 0.1-12.0 不一致，导致回环 ICP 用错 3D 点集合"。
+#   D3 之前 yaml 没有消费者，所以写错也没人发现；D3 把 yaml 接上之后，
+#   这里就成了真正生效的那份 —— 不改回来等于把修好的 bug 又装回去。
+min_depth: 0.1
+
+# 最大有效深度（米）。过远的点噪声大且分辨率低。
+# 室内场景（freiburg1_desk2）：11m 最大深度 → 12m 覆盖全部有效点。
+# 户外场景再单独调大（同时要改 Tracking 的 max_depth，否则两侧对不上）。
+max_depth: 12.0
+
+
+# ---------- 其他 ----------
+# 是否使用 Fundamental Matrix 代替 Essential Matrix。
+# false = 使用 Essential Matrix（推荐，要求已知内参）
+# true = 使用 Fundamental Matrix（不要求内参，但精度较低）
+# 注意：当前 SLAM 系统已知相机内参，应使用 Essential Matrix。
+use_fundamental: false

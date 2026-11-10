@@ -1,0 +1,54 @@
+%YAML 1.0
+# ================================================================
+# Feature Matcher 配置文件
+# 文件路径: config/feature_matcher.yaml
+# 模块: 特征匹配 - 描述子匹配
+# 加载: sfc_core::config::loadFeatureMatcherConfig()
+# ================================================================
+#
+# 说明：
+#   本文件是 MatcherConfig 的唯一来源。
+#   字段与 MatcherConfig 成员一一对应，键名即字段名。
+#
+# 关于已删除的键：
+#   matcher_type / min_dist_slack / bidirectional_match / skip_bidirectional /
+#   ransac_threshold
+#   MatcherConfig 里没有这些字段，实现也用不到：
+#   - 匹配器固定为 cv::BFMatcher(NORM_HAMMING)，没有 FLANN 分支；
+#     交叉一致性由 cross_check 控制（cv::BFMatcher 的第二个构造参数）；
+#   - 距离阈值就是 max_hamming_dist，没有 min_dist + slack 的松弛逻辑；
+#   - removeOutliers() 是空实现，ransac_threshold 无消费者。
+#   这些键只在已被注释掉的 test_visual_slam target 里出现过。
+#   写在这里会让人以为可以切换匹配器，实际改了没有任何效果（R-019）。
+# ================================================================
+
+# Lowe 比率阈值（KNN k=2）。
+# ratio < lowe_ratio 时接受匹配；值越小越严格。
+# 建议值：0.60-0.75（0.75 更宽松，匹配数多但误匹配也多）。
+lowe_ratio: 0.75
+
+# 最大汉明距离阈值。ORB 描述子距离超过此值的匹配被过滤。
+# 建议值：
+#   - 室内近距离（< 5m）：30-50
+#   - 户外远距离（> 10m）：50-80
+#   - TUM RGB-D 数据集：40-60
+max_hamming_dist: 60
+
+# 是否启用交叉一致性检查。
+# true = query→train 与 train→query 都通过才接受（更准、更少）。
+# false = 只做单向匹配（更快，但误匹配概率增加）。
+cross_check: false
+
+# 描述子维度（ORB 为 64 字节 = 512 bit）。
+descriptor_dim: 64
+
+# 投影搜索的粗匹配阈值（汉明距离）。
+# searchByProjection 第一轮用 th_high 粗筛，第二轮用 th_low 精修。
+th_high: 100
+th_low: 50
+
+# 旋转直方图分箱数（用于剔除方向不一致的匹配）。
+histo_length: 30
+
+# 匹配后是否检查关键点主方向一致性。
+check_orientation: true
