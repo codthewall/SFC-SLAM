@@ -2763,7 +2763,7 @@ int Tracking::poseOptimization() {
     // 恢复优化后的 pose
     // R1：g2o 顶点里是 T_cw，必须换回对外的 T_wc 才能写回 mCurrentFrame_->pose
     g2o::SE3Quat se3_recov = vSE3->estimate();
-    Pose new_pose = poseFromCw(se3_recov.rotation(), se3_recov.translation());
+    Pose new_pose = poseFromCw(se3_recov.rotation().toRotationMatrix(), se3_recov.translation());
 
     if (!new_pose.t.allFinite() || !new_pose.q.coeffs().allFinite() ||
         new_pose.t.norm() > 1e6 || new_pose.q.norm() < 0.1) {

@@ -1253,10 +1253,10 @@ int PoseGraphOptimizer::optimize(double* out_chi2, int* out_iterations) {
     {
         int n_vertices = 0;
         int n_fixed = 0;
-        for (auto* v : optimizer_->vertices()) {
+        for (const auto& vp : optimizer_->vertices()) {
+            const g2o::VertexSE3Expmap* v = dynamic_cast<const g2o::VertexSE3Expmap*>(vp.second);
             if (!v) continue;
-            ++n_vertices;
-            if (v->fixed()) ++n_fixed;
+            ++n_vertices; if (v->fixed()) ++n_fixed;
         }
         const int n_active_edges = static_cast<int>(optimizer_->edges().size());
         const int n_free = n_vertices - n_fixed;
