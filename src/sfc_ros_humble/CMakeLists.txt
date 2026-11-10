@@ -125,22 +125,31 @@ include_directories(
 # )
 
 # 安装头文件：include/sfc_ros_humble/
-install(
-  DIRECTORY include/${PROJECT_NAME}/
-  DESTINATION include/${PROJECT_NAME}
-)
+# git 不跟踪空目录：本包还没有对外头文件时，clone 下来这个目录根本不存在，
+# install(DIRECTORY ...) 会报 "file INSTALL cannot find ...: No such file or directory"。
+# launch/ 与 rviz/ 同理，所以三处都加 EXISTS 守卫；目录里有东西时行为不变。
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/include/${PROJECT_NAME}")
+  install(
+    DIRECTORY include/${PROJECT_NAME}/
+    DESTINATION include/${PROJECT_NAME}
+  )
+endif()
 
 # 安装launch文件
-install(
-  DIRECTORY launch/
-  DESTINATION share/${PROJECT_NAME}/launch
-)
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/launch")
+  install(
+    DIRECTORY launch/
+    DESTINATION share/${PROJECT_NAME}/launch
+  )
+endif()
 
 # 安装RViz配置文件
-install(
-  DIRECTORY rviz/
-  DESTINATION share/${PROJECT_NAME}/rviz
-)
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/rviz")
+  install(
+    DIRECTORY rviz/
+    DESTINATION share/${PROJECT_NAME}/rviz
+  )
+endif()
 
 # ========== ROS2必须的结尾 ==========
 ament_package()
