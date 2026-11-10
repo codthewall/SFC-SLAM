@@ -367,6 +367,12 @@ loadTrackingConfig(const std::string& yaml_path) {
         getDouble(fs, "frame_jump_max_translation", cfg.frame_jump_max_translation);
     cfg.frame_jump_max_rotation =
         getDouble(fs, "frame_jump_max_rotation", cfg.frame_jump_max_rotation);
+    cfg.frame_jump_max_speed =
+        getDouble(fs, "frame_jump_max_speed", cfg.frame_jump_max_speed);
+    cfg.frame_jump_max_angular_speed =
+        getDouble(fs, "frame_jump_max_angular_speed", cfg.frame_jump_max_angular_speed);
+    cfg.frame_gap_velocity_reset_s =
+        getDouble(fs, "frame_gap_velocity_reset_s", cfg.frame_gap_velocity_reset_s);
 
     // 注：extractor_config / matcher_config 故意不在这里读。
     // 它们的唯一来源分别是 feature_extractor.yaml 与 feature_matcher.yaml，

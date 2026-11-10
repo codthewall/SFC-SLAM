@@ -7,6 +7,7 @@
 
 // 第三方库（g2o / Eigen / OpenCV）必须在命名空间外部引入
 #include <algorithm>
+#include <cstddef>
 #include <cstring>
 #include <cmath>
 #include <cstdint>
@@ -231,6 +232,12 @@ constexpr double RELOC_MAX_DELTA_T = 3.0;
 // 重定位输出位姿的相机高度下限（米）。TUM fr1 手持序列相机高度约 0.9~1.3m，
 // 这里只做"明显钻到地下"的粗筛，不约束正常高度波动。
 constexpr double MIN_RELOC_CAMERA_Z = -2.0;
+
+// 重定位候选的最低匹配数。下游 findEssentialMat（≥10）与 PnP 至少要这么多
+// 3D-2D 对才有意义，低于它的候选会被整条跳过。投影匹配与 BoW 回退必须共用
+// 同一个门限：投影匹配只给 10~14 条时，候选既过不了下游检查、又因为"投影匹配
+// 非空"而挡住 BoW 回退，等于被无声丢弃。
+constexpr std::size_t RELOC_MIN_RAW_MATCHES = 15;
 
 // 帧间位姿跳变上限由 config_.frame_jump_max_translation / frame_jump_max_rotation
 // 提供（默认 0.15 m / 0.26 rad）。原实现把 0.5 m / 0.524 rad 硬编码在这里，
@@ -637,6 +644,7 @@ Pose Tracking::track(const cv::Mat& rgb_img,
 
     if (!is_initialized_) {
         initialize();
+        mLastFrameTimestamp_ = timestamp;
     }
     mTrackedFr_++;
 
@@ -696,6 +704,19 @@ Pose Tracking::track(const cv::Mat& rgb_img,
                   << " nKFs=" << mvpLocalKeyFrames_.size()
                   << " is_init=" << is_initialized_
                   << std::endl; }
+    }
+
+    // 帧间时间洞：掉帧后 dt 可能是标称 33 ms 的数倍（本数据集最大洞 0.3 s）。
+    // 恒速外推只能猜"一帧"的位移，却被要求跨过被跳过的九帧，2 m 处误差可达
+    // 0.5 m，远超 30 px 投影窗：MOTION_MODEL 必失败，还会把错位移写进 mVelocity_。
+    const double frame_dt = (mLastFrameTimestamp_ > 0.0) ? (timestamp - mLastFrameTimestamp_) : 0.0;
+    if (mLastFrame_ && frame_dt > config_.frame_gap_velocity_reset_s) {
+        mbVelocityValid_ = false;
+        if (config_.verbose_diag) {
+            std::cerr << "[Track] f=" << mCurrentFrame_->id << " 帧间 dt=" << frame_dt
+                      << "s > " << config_.frame_gap_velocity_reset_s
+                      << "s（掉帧），丢弃速度先验" << std::endl;
+        }
     }
 
     // 跟踪阶段
@@ -826,30 +847,18 @@ Pose Tracking::track(const cv::Mat& rgb_img,
     if (tracking_ok) {
         Pose current_pose = mCurrentFrame_->pose;
 
-        // ★★★ Bug Fix #36: 始终在跟踪成功后调用 poseOptimization() 进行 BA 精化 ★★★
-        // 根本原因：原代码在跟踪成功后设置 skip_local_ba=true，跳过了 poseOptimization()。
-        // 导致：
-        // 1. REF_KF_FALLBACK / REF_KF / MOTION_MODEL 成功后，直接使用 PnP 的粗位姿，不进行 BA 精化
-        // 2. PnP 粗位姿本身有较大误差（通常 10-50px 重投影误差），未精化就直接用于下一帧预测
-        // 3. RELOC 成功后，位姿未经验证就使用
-        //
-        // poseOptimization() 的作用（不应被跳过）：
-        // 1. 使用鲁棒核 Huber 核容忍较大初始误差（chi2_th=100000）
-        // 2. 4轮迭代 BA 精化位姿（通常收敛 1-10px）
-        // 3. 验证位姿变化（t_diff < 1m, rot_diff < 1rad），防止发散
-        // 4. 标记外点、更新 found_count（地图点质量维护）
-        //
-        // 修复：在所有跟踪成功路径之后，统一调用 poseOptimization()
+        // 跟踪成功后统一跑一次 poseOptimization：三条成功路径（MOTION_MODEL /
+        // REF_KF / RELOC）拿到的都是 PnP 粗位姿（重投影误差 10~50 px），不精化就
+        // 直接当下一帧预测的基准，误差会一帧一帧传下去。它同时负责标记外点、
+        // 更新 found_count，以及校验"优化后 vs 优化前"的位移/转角防止发散。
         updateLocalMap(true);
         searchLocalPoints();
         nGood = poseOptimization();
         mnMatchesInliers_ = nGood;
 
-        // 帧间跳变保护：poseOptimization 内部只校验「优化结果 vs 本帧初值」，
-        // 初值本身错了它看不出来。这里再和上一帧的真实位姿比一次——室内手持
-        // 30Hz 下单帧位移 3–7cm、转角 <10°，超出量级说明这一帧的解不可信。
-        // RELOC 例外：重定位本来就是「跳回正确位置」，此时和上一帧比必然很大，
-        // 由 relocalization() 自己的内点率/位移门槛负责（见 RELOC_MAX_DELTA_T）。
+        // 帧间跳变保护：poseOptimization 只校验「优化结果 vs 本帧初值」，初值本身
+        // 错了它看不出来。这里再和上一帧比一次。RELOC 例外——它本来就是「跳回正确
+        // 位置」，由 relocalization() 自己的内点率/位移门槛负责（见 RELOC_MAX_DELTA_T）。
         if (nGood > 0 && track_method != "RELOC" && mLastFrame_) {
             const double frame_t =
                 (mCurrentFrame_->pose.t - mLastFrame_->pose.t).norm();
@@ -857,13 +866,18 @@ Pose Tracking::track(const cv::Mat& rgb_img,
             Eigen::Quaterniond q_l = mLastFrame_->pose.q;
             if (q_c.coeffs().dot(q_l.coeffs()) < 0.0) q_c.coeffs() = -q_c.coeffs();
             const double frame_rot = Eigen::AngleAxisd(q_c * q_l.inverse()).angle();
-            if (frame_t > config_.frame_jump_max_translation ||
-                frame_rot > config_.frame_jump_max_rotation) {
+            // 上限按真实帧间时间缩放：正常 33 ms 时退化成配置的固定阈值（0.15 m /
+            // 0.26 rad），掉帧洞之后按速度上限给预算，免得把合法的大步长判成跳变。
+            const double max_frame_t = std::max(config_.frame_jump_max_translation,
+                                                config_.frame_jump_max_speed * frame_dt);
+            const double max_frame_rot = std::max(config_.frame_jump_max_rotation,
+                                                  config_.frame_jump_max_angular_speed * frame_dt);
+            if (frame_t > max_frame_t || frame_rot > max_frame_rot) {
                 if (config_.verbose_diag) {
                     std::cerr << "[Track] f=" << mCurrentFrame_->id
                               << " 帧间跳变过大 t=" << frame_t << "m rot=" << frame_rot
-                              << "rad (上限 " << config_.frame_jump_max_translation << "m / "
-                              << config_.frame_jump_max_rotation << "rad) → 判为跟踪失败"
+                              << "rad (上限 " << max_frame_t << "m / "
+                              << max_frame_rot << "rad, dt=" << frame_dt << "s) → 判为跟踪失败"
                               << std::endl;
                 }
                 nGood = 0;
@@ -1001,6 +1015,7 @@ Pose Tracking::track(const cv::Mat& rgb_img,
     retireBadMapPoints();
 
     mLastFrame_ = mCurrentFrame_;
+    mLastFrameTimestamp_ = timestamp;
     last_inlier_count_ = mnMatchesInliers_;
 
     // 帧末不再重建临时地图点。这里原有一段"用当前帧 pose 重建 mlpTemporalPoints_"的代码，
@@ -1694,18 +1709,19 @@ bool Tracking::relocalization() {
     }
 
     // ================================================================
-    // ★★★ 新增：运动模型先验预测当前帧 pose ★★★
-    // 思路：RELOC 时相邻帧运动很小，利用上一帧 pose + 速度预测当前帧位置
-    // 然后用预测 pose 做投影匹配，几何一致性高，PnP 内点率会大幅提升
+    // 运动模型先验预测当前帧 pose：有速度按恒速外推，否则退回上一帧位姿（跟踪
+    // 失败时就是冻结值）。后者只当**匹配**先验用——命中与否由描述子+比值决定，
+    // 先验偏到几米外时投影位置附近没有同描述子的点，匹配自然降到 0 并退回 BoW；
+    // 但它绝不能当 PnP 初值（见下方 pnp_init_pose）。
     // ================================================================
     Pose predicted_pose;
     bool has_predicted_pose = false;
-    
+
     if (mLastFrame_ && mbVelocityValid_) {
         Eigen::Matrix3d R_pred = mVelocity_.q.toRotationMatrix() * mLastFrame_->pose.q.toRotationMatrix();
         Eigen::Vector3d t_pred = mLastFrame_->pose.t + mVelocity_.t;
         predicted_pose.q = Eigen::Quaterniond(R_pred);
-        normalizeQuaternion(predicted_pose.q);  // ★★★ 防止四元数数值误差累积 ★★★
+        normalizeQuaternion(predicted_pose.q);  // 防止四元数数值误差累积
         predicted_pose.t = t_pred;
         has_predicted_pose = true;
     } else if (mLastFrame_) {
@@ -1713,12 +1729,8 @@ bool Tracking::relocalization() {
         has_predicted_pose = true;
     }
     
-    // ★★★ Bug Fix: Reloc 多次失败后渐进放宽搜索阈值 ★★★
-    // 问题：Reloc 连续失败时，所有候选关键帧都以相同标准评判，
-    // 导致"坏候选优先匹配"后，好的候选反而被跳过。
-    // 修复：连续失败越多，搜索窗口越大，PnP 阈值越宽松。
-    // 注意：放宽后的阈值仍然足够严格（至少 5 个内点 + 5% 内点率），
-    // 防止极低质量的 RELOC 通过导致灾难性路径漂移。
+    // 渐进放宽：连续失败越多，搜索窗越大、PnP 门槛越松。不加这个，所有候选
+    // 都按同一标准评判，"坏候选先匹配"就吃掉整轮机会。下限仍守住"内点够撑 6-DoF"。
     int n_fail = mnRelocConsecutiveFailures_;
     // 搜索半径随失败次数扩大（base=10，每失败 5 次 +5px）
     int reloc_search_radius = std::min(10 + (n_fail / 5) * 5, 30);
@@ -1766,17 +1778,11 @@ bool Tracking::relocalization() {
         const auto& ref_kf = *p_ref_kf;
         std::vector<cv::DMatch> raw, inliers;
         
-        // ================================================================
-        // ★★★ 两种匹配策略：投影匹配（优先）vs BoW 匹配（备用）★★★
-        // ================================================================
-        std::vector<cv::DMatch> proj_matches;  // 投影匹配结果
+        // 投影匹配优先（先验可信时几何一致性高），否则 BoW 绝对匹配。
+        std::vector<cv::DMatch> proj_matches;
         
         if (has_predicted_pose) {
-            // ================================================================
-            // 策略 1：投影匹配（利用运动模型先验）
-            // 用预测 pose 将关键帧的 3D 点投影到当前帧，在投影位置附近搜索匹配
-            // 几何一致性高，PnP 内点率大幅提升
-            // ================================================================
+            // 策略 1：用预测 pose 把关键帧 3D 点投到当前帧，在投影邻域内找匹配。
             const cv::Mat& K = config_.K;
             CameraParams cam = getCameraParams(K);
             const auto& ref_kps = (!ref_kf.undistorted_keypoints.empty())
@@ -1799,8 +1805,8 @@ bool Tracking::relocalization() {
                 PinholeIntrinsics{cam.fx, cam.fy, cam.cx, cam.cy}, proj_cfg);
         }
         
-        // 使用投影匹配或 BoW 匹配
-        if (has_predicted_pose && proj_matches.size() >= 10) {
+        // 投影匹配与 BoW 共用同一个最低匹配门限：投影不足就回退 BoW，不浪费候选。
+        if (has_predicted_pose && proj_matches.size() >= RELOC_MIN_RAW_MATCHES) {
             raw = proj_matches;
         } else {
             matcher_->match(ref_kf.descriptors, mCurrentFrame_->descriptors, raw);
@@ -1808,7 +1814,7 @@ bool Tracking::relocalization() {
         
         const auto& ref_kps = (!ref_kf.undistorted_keypoints.empty())
             ? ref_kf.undistorted_keypoints : ref_kf.keypoints;
-        if (raw.size() < 15) continue;
+        if (raw.size() < RELOC_MIN_RAW_MATCHES) continue;
 
         // ★★★ 几何过滤：用 5 点法 RANSAC 估计本质矩阵，筛选极线一致性匹配 ★★★
         // ★★★ 放宽到 10 个匹配（更激进地尝试重定位）★★★
@@ -1884,17 +1890,11 @@ bool Tracking::relocalization() {
         }
         if (pts3d.size() < 4) continue;
 
-        // ★★★ 关键修复：PnP 初始位姿应该接近真实相机位姿 ★★★
-        // 原问题：
-        //   - predicted_pose = mLastFrame_->pose + velocity，而第一帧 pose=(0,0,0)
-        //   - Reloc 失败时 mLastFrame_ 始终是第一帧（ID=0）
-        //   - 导致 predicted_pose ≈ (0,0,0)，PnP 初始值完全错误
-        //   - PnP 无法从错误初值收敛到正确解
-        // 修复策略：
-        //   1. 如果参考关键帧是第一帧（pose≈0），尝试用相对运动估计
-        //   2. 否则用参考关键帧的位姿作为初始估计
+        // PnP 初值：只有恒速先验有效时才用预测位姿。没有速度时上一帧位姿就是
+        // 跟踪失败冻结下来的值，可能已经落后几米，拿它当初值会把 GN 精化拽在原地；
+        // 候选关键帧的位姿则永远是一个真位姿，且 BoW 候选与当前观测相似、空间上近。
         Pose pnp_init_pose;
-        if (has_predicted_pose) {
+        if (has_predicted_pose && mbVelocityValid_) {
             // 检查预测位姿是否合理（不能太接近原点）
             double pred_norm = predicted_pose.t.norm();
             double ref_norm = ref_kf.world_pose.t.norm();

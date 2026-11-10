@@ -53,6 +53,12 @@ struct TrackingConfig {
     // 拿优化结果与上一帧真实位姿比，只拦"明显不是单帧运动"的解；取真实上限约 3 倍。
     double frame_jump_max_translation = 0.15;
     double frame_jump_max_rotation = 0.26;
+    // 同一个守卫在掉帧洞之后的上限：按"速度上限 × 真实帧间时间"给预算，
+    // 与固定阈值取较大者。正常 33 ms 帧下这两项都小于固定阈值，行为不变。
+    double frame_jump_max_speed = 1.0;              // m/s，实测 GT 均速 0.46、p99 逐帧 ≈0.92 m/s
+    double frame_jump_max_angular_speed = 2.0;      // rad/s
+    // 帧间 dt 超过此值即视为掉帧：恒速先验跨不了这么大的时间洞，直接作废。
+    double frame_gap_velocity_reset_s = 0.1;
 
     double min_keyframe_translation = 0.05;
     double min_keyframe_rotation = 0.05;
@@ -318,6 +324,7 @@ private:
     bool mbMapUpdated_ = false;
     bool mbVO_ = false;
     double mTimeStampLost_ = 0.0;  // 跟踪丢失时的时间戳
+    double mLastFrameTimestamp_ = 0.0;  // 上一帧时间戳，用于算真实帧间 dt（掉帧洞）
 
     // ===== 局部关键帧 =====
     // 只追加（push_back），不删除。最多 20 个，超过则从头删除
