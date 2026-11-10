@@ -114,6 +114,12 @@ struct TrackingConfig {
     // 在这种状态下被当成"跟踪成功"，位姿噪声直接进轨迹）。健康帧有数百内点。
     int pose_opt_min_inliers = 20;
 
+    // RELOC 成功后重建地图点关联时，允许的重投影误差（像素）。
+    // 重定位的位姿由 PnP 给出，只有重投影残差与这个位姿自洽的匹配才算"这条 3D 点
+    // 确实被当前帧观测到"。取 PnP 末轮阈值（pnp_final_thresh_px）的 2 倍量级：
+    // 比它严等于要求 PnP 内点，比它松就会把错配重新放进位姿优化。
+    double reloc_assoc_reproj_px = 6.0;
+
     bool verbose_diag = false;
 
     // 关键点去畸变开关。R3 之后语义收敛为「相机模型要不要去畸变」，

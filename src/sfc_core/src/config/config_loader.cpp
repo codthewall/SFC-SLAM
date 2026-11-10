@@ -394,6 +394,9 @@ loadTrackingConfig(const std::string& yaml_path) {
     // poseOptimization 的内点下限。此前只存在于 TrackingConfig 里、没有 YAML 入口，
     // 默认值 5 意味着 5 个点就敢接受 6 自由度解 —— 退化帧会被当成成功。
     cfg.pose_opt_min_inliers = getInt(fs, "pose_opt_min_inliers", cfg.pose_opt_min_inliers);
+    // 重定位后重建关联的重投影门限（像素）。默认值取自结构体（R-019）。
+    cfg.reloc_assoc_reproj_px =
+        getDouble(fs, "reloc_assoc_reproj_px", cfg.reloc_assoc_reproj_px);
 
     // 关键帧判定（判定本体见 frontend/keyframe_policy.hpp）
     cfg.min_keyframe_translation = getDouble(fs, "min_keyframe_translation", cfg.min_keyframe_translation);

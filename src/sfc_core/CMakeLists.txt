@@ -139,6 +139,7 @@ add_library(${PROJECT_NAME} SHARED
   src/frontend/covis_manager.cpp
   src/frontend/tracking.cpp
   src/frontend/keyframe_policy.cpp
+  src/frontend/reprojection_association.cpp
   src/frontend/depth_filter.cpp
   src/frontend/frame.cpp
   src/frontend/sophus_pose_adapter.cpp
@@ -190,6 +191,19 @@ target_link_libraries(test_keyframe_policy
 )
 target_compile_options(test_keyframe_policy PRIVATE -Usfc_core)
 install(TARGETS test_keyframe_policy
+  DESTINATION lib/${PROJECT_NAME}
+)
+
+# 测试可执行程序：投影关联判据单测（纯逻辑，不需要相机数据与 g2o）
+add_executable(test_reprojection_association
+  test/test_reprojection_association.cpp
+)
+target_link_libraries(test_reprojection_association
+  ${PROJECT_NAME}
+  ${OpenCV_LIBS}
+)
+target_compile_options(test_reprojection_association PRIVATE -Usfc_core)
+install(TARGETS test_reprojection_association
   DESTINATION lib/${PROJECT_NAME}
 )
 

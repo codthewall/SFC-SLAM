@@ -32,6 +32,7 @@
 
 // 项目自身头文件
 #include "sfc_core/frontend/frame.hpp"
+#include "sfc_core/frontend/reprojection_association.hpp"
 #include "sfc_core/frontend/tracking.hpp"
 #include "sfc_core/frontend/depth_filter.hpp"
 #include "sfc_core/frontend/keyframe_policy.hpp"
@@ -1778,59 +1779,24 @@ bool Tracking::relocalization() {
             // ================================================================
             const cv::Mat& K = config_.K;
             CameraParams cam = getCameraParams(K);
-            double fx = cam.fx, fy = cam.fy, cx = cam.cx, cy = cam.cy;
-
             const auto& ref_kps = (!ref_kf.undistorted_keypoints.empty())
                 ? ref_kf.undistorted_keypoints : ref_kf.keypoints;
-            std::set<int> matched_curr_indices;
 
-            for (int i = 0; i < static_cast<int>(ref_kps.size()); ++i) {
-                if (i >= static_cast<int>(ref_kf.depth_valid.size()) ||
-                    !ref_kf.depth_valid[i]) continue;
-                if (i >= static_cast<int>(ref_kf.pts_3d.size())) continue;
-                const auto& p3d_cam = ref_kf.pts_3d[i];
-                if (p3d_cam.norm() < 1e-6) continue;
-
-                // 参考关键帧：相机点 → 世界点
-                Eigen::Vector3d p3d_world = camToWorldPoint(p3d_cam, ref_kf.world_pose);
-                if (p3d_world.z() < 0.05) continue;
-
-                // 当前帧：用预测位姿投影到相机
-                Eigen::Vector3d pt_cam_curr = worldToCam(p3d_world, predicted_pose);
-                double z_curr = pt_cam_curr.z();
-                if (z_curr < 0.05 || !std::isfinite(z_curr)) continue;
-
-                double invz = 1.0 / z_curr;
-                float u_f = static_cast<float>(fx * pt_cam_curr.x() * invz + cx);
-                float v_f = static_cast<float>(fy * pt_cam_curr.y() * invz + cy);
-                if (u_f < 0 || u_f >= mCurrentFrame_->gray_img.cols ||
-                    v_f < 0 || v_f >= mCurrentFrame_->gray_img.rows) continue;
-
-                float radius = static_cast<float>(15.0 * pt_cam_curr.z() / 2.0);
-                radius = std::min(std::max(radius, 10.0f), 30.0f);
-
-                float best_dist = 256;
-                int best_idx = -1;
-                for (size_t k = 0; k < curr_kpts.size(); ++k) {
-                    if (matched_curr_indices.count(static_cast<int>(k))) continue;
-                    float du = curr_kpts[k].pt.x - u_f;
-                    float dv = curr_kpts[k].pt.y - v_f;
-                    float dist = std::sqrt(du*du + dv*dv);
-                    if (dist < radius && dist < best_dist) {
-                        best_dist = dist;
-                        best_idx = static_cast<int>(k);
-                    }
-                }
-
-                if (best_idx >= 0) {
-                    cv::DMatch m;
-                    m.queryIdx = i;
-                    m.trainIdx = best_idx;
-                    m.distance = best_dist;
-                    proj_matches.push_back(m);
-                    matched_curr_indices.insert(best_idx);
-                }
-            }
+            // 投影 + 描述子 + Lowe 比值 + 像素窗，全部判据在
+            // frontend/reprojection_association（可单测的纯函数）。
+            // 原实现在这里只按"投影位置最近的像素"取点：不比描述子、不做比值检验，
+            // 投影位置附近只要有特征点就被当成这个 3D 点的对应。RELOC 的 3D-2D 集合
+            // 因此大半是错配，PnP 只能收敛到预测位姿附近的偏移解。
+            ProjectionSearchConfig proj_cfg;
+            proj_cfg.hamming_threshold = config_.matcher_config.max_hamming_dist;
+            proj_cfg.lowe_ratio = config_.matcher_config.lowe_ratio;
+            proj_matches = matchReferenceByProjection(
+                ref_kps, ref_kf.descriptors, ref_kf.pts_3d, ref_kf.depth_valid,
+                ref_kf.world_pose.q.toRotationMatrix(), ref_kf.world_pose.t,
+                predicted_pose.q.toRotationMatrix(), predicted_pose.t,
+                curr_kpts, mCurrentFrame_->descriptors,
+                mCurrentFrame_->gray_img.cols, mCurrentFrame_->gray_img.rows,
+                PinholeIntrinsics{cam.fx, cam.fy, cam.cx, cam.cy}, proj_cfg);
         }
         
         // 使用投影匹配或 BoW 匹配
@@ -2149,41 +2115,50 @@ bool Tracking::relocalization() {
     }
     const auto& best_kf = *p_best_kf;
 
-    // 重新匹配并创建地图点
-    std::vector<cv::DMatch> raw2, inliers2;
+    // 关联重建：只保留与 best_pose 自洽的匹配（R6）。
+    // 原实现把普通 BoW 匹配（removeOutliers 只按汉明距离 80 粗筛，没有几何复核）
+    // 整批写成当前帧的地图点关联并逐条 createMapPoint —— 那些错配随后被
+    // poseOptimization 当作"已验证观测"使用，把刚刚由 PnP 得到的位姿又拉偏一次。
+    // 现在先按 best_pose 重投影复核，残差超限的匹配不参与建图也不参与位姿优化。
+    std::vector<cv::DMatch> raw2;
     matcher_->match(best_kf.descriptors, mCurrentFrame_->descriptors, raw2);
-    const auto& best_kps = (!best_kf.undistorted_keypoints.empty())
-        ? best_kf.undistorted_keypoints : best_kf.keypoints;
-    matcher_->removeOutliers(raw2, best_kps, curr_kpts, inliers2);
+
+    std::vector<cv::Point2f> curr_uv(curr_kpts.size());
+    for (size_t k = 0; k < curr_kpts.size(); ++k) curr_uv[k] = curr_kpts[k].pt;
+
+    const CameraParams assoc_cam = getCameraParams(config_.K);
+    const PinholeIntrinsics assoc_intr{assoc_cam.fx, assoc_cam.fy, assoc_cam.cx, assoc_cam.cy};
+    const std::vector<AssociationCandidate> assoc = verifyAssociationsAgainstPose(
+        raw2, best_kf.pts_3d, best_kf.depth_valid,
+        best_kf.world_pose.q.toRotationMatrix(), best_kf.world_pose.t,
+        curr_uv, best_pose.q.toRotationMatrix(), best_pose.t,
+        assoc_intr, static_cast<float>(config_.reloc_assoc_reproj_px), MIN_PROJECTION_Z);
 
     mvpCurrentMapPointIds_.assign(mCurrentFrame_->keypoints.size(), -1);
-    for (const auto& m : inliers2) {
-        int idx_ref = m.queryIdx, idx_curr = m.trainIdx;
-        if (idx_ref >= static_cast<int>(best_kf.depth_valid.size()) ||
-            !best_kf.depth_valid[idx_ref]) continue;
-        if (idx_ref >= static_cast<int>(best_kf.pts_3d.size())) continue;
-        const auto& p3d_cam = best_kf.pts_3d[idx_ref];
-        if (p3d_cam.norm() < 1e-6) continue;
-
-        Eigen::Vector3d p3d_world = camToWorldPoint(p3d_cam, best_kf.world_pose);
-
+    for (const auto& a : assoc) {
         cv::Mat desc;
-        if (idx_curr < mCurrentFrame_->descriptors.rows)
-            desc = mCurrentFrame_->descriptors.row(idx_curr);
-        int mp_id = createMapPoint(p3d_world, desc, mCurrentFrame_->id, idx_curr, 1);
+        if (a.current_index < mCurrentFrame_->descriptors.rows)
+            desc = mCurrentFrame_->descriptors.row(a.current_index);
+        int mp_id = createMapPoint(a.world_point, desc, mCurrentFrame_->id, a.current_index, 1);
         if (mp_id < 0) continue;  // 3D 点非法，createMapPoint 已拒绝
 
         // 补充参考关键帧的观测
         mapping::MapPoint* mp = mpMap_->getMapPoint(mp_id);
         if (mp) {
-            mp->addObservation(best_kf.frame_id, idx_ref);
+            mp->addObservation(best_kf.frame_id, a.ref_index);
             mp->increaseFound();
-            if (mp->getDescriptor().empty() && idx_ref < best_kf.descriptors.rows)
-                mp->setDescriptor(best_kf.descriptors.row(idx_ref));
+            if (mp->getDescriptor().empty() && a.ref_index < best_kf.descriptors.rows)
+                mp->setDescriptor(best_kf.descriptors.row(a.ref_index));
         }
 
-        if (idx_curr < static_cast<int>(mvpCurrentMapPointIds_.size()))
-            mvpCurrentMapPointIds_[idx_curr] = mp_id;
+        if (a.current_index < static_cast<int>(mvpCurrentMapPointIds_.size()))
+            mvpCurrentMapPointIds_[a.current_index] = mp_id;
+    }
+
+    if (config_.verbose_diag) {
+        std::cerr << "[Reloc] f=" << mCurrentFrame_->id
+                  << " assoc: bow=" << raw2.size() << " verified=" << assoc.size()
+                  << " (gate " << config_.reloc_assoc_reproj_px << " px)" << std::endl;
     }
 
     // ★★★ Bug Fix: RELOC 后必须将 best_pose 应用到当前帧 ★★★
