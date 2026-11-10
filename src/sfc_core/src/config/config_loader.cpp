@@ -387,12 +387,32 @@ loadTrackingConfig(const std::string& yaml_path) {
     cfg.pnp_huber_delta = getDouble(fs, "pnp_huber_delta", cfg.pnp_huber_delta);
     cfg.pnp_use_depth_weighting =
         getBool(fs, "pnp_use_depth_weighting", cfg.pnp_use_depth_weighting);
+    // poseOptimization 的内点下限。此前只存在于 TrackingConfig 里、没有 YAML 入口，
+    // 默认值 5 意味着 5 个点就敢接受 6 自由度解 —— 退化帧会被当成成功。
+    cfg.pose_opt_min_inliers = getInt(fs, "pose_opt_min_inliers", cfg.pose_opt_min_inliers);
 
-    // 关键帧判定
+    // 关键帧判定（判定本体见 frontend/keyframe_policy.hpp）
     cfg.min_keyframe_translation = getDouble(fs, "min_keyframe_translation", cfg.min_keyframe_translation);
     cfg.min_keyframe_rotation = getDouble(fs, "min_keyframe_rotation", cfg.min_keyframe_rotation);
     cfg.min_features = getInt(fs, "min_features", cfg.min_features);
     cfg.forced_keyframe_interval = getInt(fs, "forced_keyframe_interval", cfg.forced_keyframe_interval);
+    cfg.min_keyframe_gap_frames = getInt(fs, "min_keyframe_gap_frames", cfg.min_keyframe_gap_frames);
+    cfg.keyframe_min_tracked_inliers =
+        getInt(fs, "keyframe_min_tracked_inliers", cfg.keyframe_min_tracked_inliers);
+    cfg.keyframe_weak_tracked_ratio =
+        getDouble(fs, "keyframe_weak_tracked_ratio", cfg.keyframe_weak_tracked_ratio);
+    cfg.keyframe_rescue_min_inliers =
+        getInt(fs, "keyframe_rescue_min_inliers", cfg.keyframe_rescue_min_inliers);
+    cfg.keyframe_rescue_max_gap =
+        getInt(fs, "keyframe_rescue_max_gap", cfg.keyframe_rescue_max_gap);
+
+    // 局部地图与建点配额
+    cfg.local_map_keyframe_window =
+        getInt(fs, "local_map_keyframe_window", cfg.local_map_keyframe_window);
+    cfg.map_point_grace_frames =
+        getInt(fs, "map_point_grace_frames", cfg.map_point_grace_frames);
+    cfg.max_new_map_points_per_kf =
+        getInt(fs, "max_new_map_points_per_kf", cfg.max_new_map_points_per_kf);
 
     // EMA 和死区
     cfg.relative_t_ema_alpha = getDouble(fs, "relative_t_ema_alpha", cfg.relative_t_ema_alpha);

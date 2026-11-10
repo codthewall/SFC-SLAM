@@ -53,10 +53,27 @@ struct TrackingConfig {
     int min_features = 50;
 
     int forced_keyframe_interval = 6;
-    // ★★★ needNewKeyFrame c1e 条件参数 ★★★
-    // c1e: 内点数少但有大量未匹配特征时，创建关键帧进行三角化
-    int c1e_min_inliers = 50;    // mnMatchesInliers_ < 此值时考虑 c1e
-    int c1e_min_unmatched = 100; // nUnmatched > 此值时才触发 c1e
+
+    // ---------------- 关键帧插入策略 ----------------
+    // 判定本体在 frontend/keyframe_policy.hpp 的 decideKeyframe()，这里是它的输入参数。
+    // min_keyframe_translation / min_keyframe_rotation / forced_keyframe_interval
+    // 继续作为同名的 YAML 键与 --kf_trans/--kf_rot 入口，不另设同义字段（R-019）。
+    // 两关键帧之间的最小帧间隔（硬下限）：原实现的"间隔>=10帧"与"内点<参考点25%"
+    // 都没有下限，于是 640 帧插出 562 个关键帧，局部地图全是零视差的相邻帧。
+    int min_keyframe_gap_frames = 8;
+    int keyframe_min_tracked_inliers = 120;   // 内点高于此值时不因相对内点率下降插帧
+    double keyframe_weak_tracked_ratio = 0.30;  // 内点 < 参考活着点数×此比例 → 跟踪退化
+    int keyframe_rescue_min_inliers = 40;     // 兜底插入：内点长期低于此值
+    int keyframe_rescue_max_gap = 60;         //   且已间隔这么多帧时插一帧
+
+    // ---------------- 局部地图与建点配额 ----------------
+    // 局部关键帧窗口。20 太小：关键帧一密，窗口只覆盖不到 1 秒的视角，没有视差。
+    int local_map_keyframe_window = 40;
+    // 新建地图点的观察期（帧）。原值 3 太短：建点时 obs_count=1，3 帧内没被
+    // 第二次观测到就整批判坏，地图长不起来。
+    int map_point_grace_frames = 8;
+    // 单个关键帧最多新建的地图点数。原值 100 让远处的强结构点抢不到配额。
+    int max_new_map_points_per_kf = 300;
     // 注：纯 VO 路径不持有 PGO / LocalBA 开关。这两个能力分别由
     // loopdetection::PoseGraphOptimizerOptions 与 frontend::CovisConfig 提供，
     // TrackingConfig 里再放一份同名字段只会造成"配置了却不生效"的假象（R-019）。
@@ -86,7 +103,10 @@ struct TrackingConfig {
     double stationary_trans_deadzone_m = 0.01;   // 平移死区（米）
     double stationary_rot_deadzone_rad = 0.01;   // 旋转死区（弧度）
 
-    int pose_opt_min_inliers = 5;  // poseOptimization 后允许的最小内点数（低于此值视为跟踪失败）
+    // poseOptimization 后的最小内点数，低于此值视为本帧跟踪失败。
+    // 原值 5：5 个点约束 6 个自由度，等于放任退化解通过（实测 267/640 帧就是
+    // 在这种状态下被当成"跟踪成功"，位姿噪声直接进轨迹）。健康帧有数百内点。
+    int pose_opt_min_inliers = 20;
 
     bool verbose_diag = false;
 

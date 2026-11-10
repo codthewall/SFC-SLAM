@@ -346,6 +346,10 @@ static bool writeTUMTrajectory(const std::string& path,
     }
     f << "# timestamp tx ty tz qx qy qz qw\n";
 
+    // 统计实际写出的行数。原实现打印的是 traj_t.size()（入参大小），
+    // 于是 kf_indices 过滤后只剩 562 行，日志却报"已保存（640 帧）"，
+    // 和 evo 读到的 562 对不上，排查时白绕了一圈。
+    size_t written = 0;
     if (kf_indices != nullptr && !kf_indices->empty()) {
         for (int fi : *kf_indices) {
             if (fi < 0 || fi >= static_cast<int>(traj_t.size())) continue;
@@ -354,6 +358,7 @@ static bool writeTUMTrajectory(const std::string& path,
             f << std::fixed << std::setprecision(9) << timestamps[fi] << " "
               << std::setprecision(9) << t_scaled.x() << " " << t_scaled.y() << " " << t_scaled.z() << " "
               << std::setprecision(9) << q.x() << " " << q.y() << " " << q.z() << " " << q.w() << "\n";
+            ++written;
         }
     } else {
         for (size_t i = 0; i < traj_t.size(); ++i) {
@@ -362,10 +367,12 @@ static bool writeTUMTrajectory(const std::string& path,
             f << std::fixed << std::setprecision(9) << timestamps[i] << " "
               << std::setprecision(9) << t_scaled.x() << " " << t_scaled.y() << " " << t_scaled.z() << " "
               << std::setprecision(9) << q.x() << " " << q.y() << " " << q.z() << " " << q.w() << "\n";
+            ++written;
         }
     }
     f.close();
-    std::cout << "[writeTUMTrajectory] 已保存: " << path << "（" << traj_t.size() << " 帧）\n";
+    std::cout << "[writeTUMTrajectory] 已保存: " << path << "（写入 " << written
+              << " 帧 / 输入 " << traj_t.size() << " 帧）\n";
     return true;
 }
 
@@ -419,6 +426,11 @@ static Args parseArgs(int argc, char** argv) {
         else if (arg == "--kf_trans" && i + 1 < argc) args.kf_trans_thresh = std::atof(argv[++i]);
         else if (arg == "--kf_rot" && i + 1 < argc) args.kf_rot_thresh = std::atof(argv[++i]);
         else if (arg == "--depth_scale" && i + 1 < argc) args.depth_scale = std::atof(argv[++i]);
+        // 深度过滤区间与最小特征数：Args 里一直有这三个字段，却从来没有解析分支，
+        // 于是命令行传 --max_depth 8.0 会被静默丢掉、实际仍用 yaml 的 12.0。
+        else if (arg == "--min_depth" && i + 1 < argc) args.min_depth = std::atof(argv[++i]);
+        else if (arg == "--max_depth" && i + 1 < argc) args.max_depth = std::atof(argv[++i]);
+        else if (arg == "--min_features" && i + 1 < argc) args.min_features = std::atoi(argv[++i]);
         else if (arg == "--vocabulary" && i + 1 < argc) args.vocabulary_path = argv[++i];
         else if (arg == "--verbose" || arg == "-v") args.verbose = true;
         else if (arg == "--slam") args.enable_slam = true;
@@ -439,6 +451,9 @@ static Args parseArgs(int argc, char** argv) {
             std::cout << "  --kf_trans     <m>      覆盖 yaml 中的关键帧平移阈值\n";
             std::cout << "  --kf_rot       <rad>    覆盖 yaml 中的关键帧旋转阈值\n";
             std::cout << "  --depth_scale  <float>  覆盖 yaml 中的深度缩放（TUM PNG: 0.0002）\n";
+            std::cout << "  --min_depth    <m>      覆盖 yaml 中的深度下限\n";
+            std::cout << "  --max_depth    <m>      覆盖 yaml 中的深度上限\n";
+            std::cout << "  --min_features <N>      覆盖 yaml 中的最少特征数\n";
             std::cout << "  --vocabulary   <path>   ORB 词汇表 .txt 路径（影响 BoW 跟踪质量）\n";
             std::cout << "  --trajectory_scale <float> 轨迹事后尺度校正（默认: 1.0）\n";
             std::cout << "  --slam                  启用回环检测 + 位姿图优化（默认纯 VO）\n";
@@ -451,6 +466,39 @@ static Args parseArgs(int argc, char** argv) {
         }
     }
     return args;
+}
+
+// ============================================================================
+// Groundtruth 查询
+// ============================================================================
+
+/**
+ * 在 groundtruth 序列里按绝对时间戳找最近的一条。
+ *
+ * @param gt_seq        已按时间升序排好的 groundtruth
+ * @param abs_timestamp 绝对时间戳（秒）。必须是数据集原始时间戳，
+ *                      不能用 fd.timestamp - base_ts 这种相对时间——
+ *                      两者差 1.3e9 秒，最近邻永远落在容差之外。
+ * @param tol_s         匹配容差（秒）
+ * @param out_t         命中时写入该条 groundtruth 的平移部分
+ * @return 在容差内找到返回 true
+ */
+static bool nearestGroundtruthTranslation(const std::vector<TUMGroundtruth>& gt_seq,
+                                          double abs_timestamp, double tol_s,
+                                          Eigen::Vector3d* out_t) {
+    if (gt_seq.empty() || out_t == nullptr) return false;
+    double best_dt = std::numeric_limits<double>::max();
+    const TUMGroundtruth* best = nullptr;
+    for (const auto& gt : gt_seq) {
+        const double dt = std::fabs(gt.timestamp - abs_timestamp);
+        if (dt < best_dt) {
+            best_dt = dt;
+            best = &gt;
+        }
+    }
+    if (best == nullptr || best_dt > tol_s) return false;
+    *out_t = best->t;
+    return true;
 }
 
 // ============================================================================
@@ -669,28 +717,22 @@ int main(int argc, char** argv) {
             Eigen::Vector3d frame_delta = (i > 0) ? (pose.t - traj_t[i - 1]) : Eigen::Vector3d::Zero().eval();
 
             std::string gt_info;
-            if (!groundtruth.empty()) {
+            if (!groundtruth.empty() && i > 0) {
                 const double TIME_TOL = 0.1;
-                double best_dt = 1e9;
-                Eigen::Vector3d gt_t_curr;
-                for (const auto& gt : groundtruth) {
-                    double dt = std::abs(gt.timestamp - ts);
-                    if (dt < best_dt) { best_dt = dt; gt_t_curr = gt.t; }
-                }
-                if (best_dt < TIME_TOL) {
-                    double prev_ts = timestamps[i - 1];
-                    double best_dt2 = 1e9;
-                    Eigen::Vector3d gt_t_prev;
-                    for (const auto& gt : groundtruth) {
-                        double dt = std::fabs(gt.timestamp - prev_ts);
-                        if (dt < best_dt2) { best_dt2 = dt; gt_t_prev = gt.t; }
-                    }
-                    if (best_dt2 < TIME_TOL) {
-                        double gt_delta = (gt_t_curr - gt_t_prev).norm();
-                        gt_info = " | GT_frame_delta=" + std::to_string(gt_delta).substr(0, 8) + "m";
-                        if (frame_delta.norm() > 0.001) {
-                            gt_info += " (SLAM/GT=" + std::to_string(frame_delta.norm() / gt_delta).substr(0, 6) + "x)";
-                        }
+                Eigen::Vector3d gt_t_curr = Eigen::Vector3d::Zero();
+                Eigen::Vector3d gt_t_prev = Eigen::Vector3d::Zero();
+                // 两个时间戳都必须是绝对时基：fd.timestamp 是原始时间戳，
+                // timestamps[i-1] 存的也是 fd.timestamp。原实现第一个查询用了
+                // 相对时间 ts，导致 best_dt 恒 >1.3e9，整段 GT 对照从未生效。
+                const bool has_curr = nearestGroundtruthTranslation(
+                    groundtruth, fd.timestamp, TIME_TOL, &gt_t_curr);
+                const bool has_prev = nearestGroundtruthTranslation(
+                    groundtruth, timestamps[i - 1], TIME_TOL, &gt_t_prev);
+                if (has_curr && has_prev) {
+                    double gt_delta = (gt_t_curr - gt_t_prev).norm();
+                    gt_info = " | GT_frame_delta=" + std::to_string(gt_delta).substr(0, 8) + "m";
+                    if (frame_delta.norm() > 0.001 && gt_delta > 1e-6) {
+                        gt_info += " (SLAM/GT=" + std::to_string(frame_delta.norm() / gt_delta).substr(0, 6) + "x)";
                     }
                 }
             }
@@ -792,8 +834,11 @@ int main(int argc, char** argv) {
         if (is_kf[fi]) kf_indices.push_back(fi);
     }
 
+    // 主轨迹必须写全部帧。原实现把 &kf_indices 也传给了主文件，
+    // 于是 sfc_traj.tum 里只有 562 行（关键帧），而 GT 是 2428 行，
+    // evo 对齐时空间覆盖本来就不全，APE 自然被放大。
     writeTUMTrajectory(args.output_traj, timestamps, traj_t, traj_q,
-                       inliers, args.trajectory_scale, &kf_indices);
+                       inliers, args.trajectory_scale, nullptr);
 
     if (!kf_indices.empty()) {
         std::string kf_tum = args.output_traj;

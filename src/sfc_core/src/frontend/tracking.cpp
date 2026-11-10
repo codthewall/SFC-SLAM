@@ -33,6 +33,7 @@
 // 项目自身头文件
 #include "sfc_core/frontend/frame.hpp"
 #include "sfc_core/frontend/tracking.hpp"
+#include "sfc_core/frontend/keyframe_policy.hpp"
 #include "sfc_core/frontend/robust_pnp_solver.hpp"
 #include "sfc_core/feature/octree_orb.hpp"
 #include "sfc_core/feature/bow_adapter.hpp"
@@ -43,10 +44,8 @@
 namespace sfc_core {
 namespace frontend {
 
-// 新建地图点的观察期（帧数）。新建点在这么多帧内即使还没有第二次观测也不判坏：
-// 它需要至少一帧的时间被 searchLocalPoints 投影匹配上。R5 之前这里隐含为 0，
-// 于是第一个关键帧就把整张前端地图判成坏点。
-constexpr int kMapPointObservationGraceFrames = 3;
+// 新建地图点的观察期（帧数）现在由 TrackingConfig::map_point_grace_frames 提供，
+// 默认 8。这里不再保留同名常量 —— 同一参数两个来源时，改了一个另一个不生效（R-019）。
 
 // E6：近邻查重的体素边长（米）与判定半径。体素只用来把候选集从全图缩到
 // 一个立方体，最终仍按真实距离判定，所以体素本身略大于半径。
@@ -216,7 +215,8 @@ inline void normalizeQuaternion(Eigen::Quaterniond& q) {
 // 关键帧相机位姿常量（单位：米）
 // ================================================================
 static constexpr double KF_BASELINE = 0.0;   // 单目 RGB-D，基线 = 0（无立体匹配）
-static constexpr double KF_TH_DEPTH = 40.0;  // 深度阈值 = max_depth * 4.0
+// 原先这里还有一个 KF_TH_DEPTH = 40.0、注释写"深度阈值 = max_depth * 4.0"，
+// 但全文件没有任何引用，而语义本身也是把 ThDepth（基线倍数）当成了米。已删除。
 
 // 投影前的最小相机系深度（米）。低于此值 1/z 放大误差，投影坐标不可信。
 // 取 0.05m 与 isInFront() 默认门槛一致，对应深度相机近端有效量程。
@@ -589,19 +589,36 @@ Pose Tracking::track(const cv::Mat& rgb_img,
                        mCurrentFrame_->descriptors);
 
     // Step 4: 关键点去畸变 —— 这是全系统唯一决定"用哪套像素坐标"的地方。
-    //   disable_undistort=true          → undistorted_keypoints = keypoints（原样，未去畸变）
-    //   disable_undistort=false && D 空 → 同上（没有畸变可去）
-    //   disable_undistort=false && D 非空 → undistortPoints(P=K) 重新像素化 → 理想像素
+    //   D 为空                          → undistorted_keypoints = keypoints（原样，没畸变可去）
+    //   D 非空                          → undistortPoints(P=K) 重新像素化 → 理想像素
+    //   D 非空 且 disable_undistort=true → 仍然去畸变（开关只对 D 为空的相机有意义），
+    //                                     首次生效时打一条警告
     // 下游（compute3DPoints / poseOptimization / PnP）一律直接消费 undistorted_keypoints，
     // 谁也不再自己二次去畸变；深度采样单独固定用畸变像素。
     mCurrentFrame_->undistorted_keypoints.clear();
     if (!mCurrentFrame_->keypoints.empty() && !config_.K.empty()) {
         mCurrentFrame_->undistorted_keypoints.reserve(mCurrentFrame_->keypoints.size());
-        if (config_.disable_undistort || config_.D.empty()) {
-            // 无需去畸变：原样复制
+        if (config_.D.empty()) {
+            // 没有畸变系数可去，原样复制。
             for (const auto& kp : mCurrentFrame_->keypoints)
                 mCurrentFrame_->undistorted_keypoints.push_back(kp);
         } else {
+            // D 非空时必须去畸变 —— disable_undistort=true 在这里不再有决定权。
+            // 原因：配置里把 disable_undistort 打开时，2D 观测和 3D 反投影会同时用
+            // 畸变像素，"自洽"地把真实的方向偏差掩盖掉，残差看起来很小、位姿却是错的。
+            // freiburg1 的畸变在画面上能到中位 4.8 px、p90 10.5 px、边缘 38 px，
+            // 而 poseOptimization 的 chi2=5.99 门限在 octave0 只相当于 3.5 px ——
+            // 也就是说一张图的多数特征点都会被判成外点。这个开关只允许在 D 为空时生效，
+            // 其余情况一律按"必须去畸变"处理，并且只提示一次，不逐帧刷屏。
+            if (config_.disable_undistort) {
+                static bool warned = false;
+                if (!warned) {
+                    warned = true;
+                    std::cerr << "[TRK] 警告: disable_undistort=true 但 D 非空，"
+                                 "已忽略该开关并强制去畸变（否则 2D/3D 两侧同时使用畸变像素，"
+                                 "重投影残差自洽但位姿错误）。" << std::endl;
+                }
+            }
             std::vector<cv::Point2f> input_pts;
             input_pts.reserve(mCurrentFrame_->keypoints.size());
             for (const auto& kp : mCurrentFrame_->keypoints)
@@ -661,18 +678,16 @@ Pose Tracking::track(const cv::Mat& rgb_img,
         updateLastFrame();
     }
 
-    // ★★★ Bug Fix: 推迟 mlpTemporalPoints_ 清空时机 ★★★
-    // 原问题：mlpTemporalPoints_ 在每帧开始时无条件清空，
-    // 导致刚在 updateLastFrame() 中创建的临时地图点立即被清空，searchByProjection 仍无点可用。
-    // 修复：在 updateLastFrame() 使用完 mlpTemporalPoints_（作为上一帧的临时点池）之后再清空，
-    // 并在每帧结束时重新用当前帧的校正 pose 创建新的临时地图点（供下帧使用）。
-    // 具体时机：
-    //   - 上方 updateLastFrame() 使用旧的 mLastFrame_ 创建 temp pts
-    //   - 此处清空旧的（来自上上帧的）temp pts
-    //   - 跟踪结束后（见 track() 末尾）用当前帧校正 pose 创建新的 temp pts
-    clearTemporalMapPoints();
-
-    // ★★★ Bug Fix: 在重置前保存上一帧的内点数 ★★★
+    // 清理时机（本次修复的关键之一）：mlpTemporalPoints_ / mTemporalMapPoints_
+    // 的生命周期是「一帧」——上一帧的临时点服务于当前帧的匹配。
+    // 正确顺序：帧首 clearTemporalMapPoints() → updateLastFrame() 为 mLastFrame_
+    // 重建临时点并写回 mLastFrameMapPointIds_ → 本帧用它做匹配与位姿优化。
+    // 原先这里是「updateLastFrame() 之后紧接一次 clearTemporalMapPoints()」，
+    // 恰好把刚建好的点全部销毁，id 立刻变悬空：searchByProjection 把悬空 id
+    // 原样搬进 mvpCurrentMapPointIds_，poseOptimization 取到 nullptr，
+    // 只剩极少数永久点能约束位姿（实测内点从 900 掉到 0~20）。
+    //
+    // ★★★ 在重置前保存上一帧的内点数 ★★★
     // mnMatchesInliers_ 将在跟踪开始时被重置为 0，
     // 但 trackWithMotionModel() 需要知道上一帧的跟踪质量来调整搜索阈值
     last_inlier_count_ = mnMatchesInliers_;
@@ -1000,46 +1015,11 @@ Pose Tracking::track(const cv::Mat& rgb_img,
     mLastFrame_ = mCurrentFrame_;
     last_inlier_count_ = mnMatchesInliers_;
 
-    // ★★★ Bug Fix: 帧结束时用当前帧的校正 pose 创建临时地图点 ★★★
-    // mlpTemporalPoints_ 在帧开始时由 updateLastFrame() 创建（基于上一帧的校正 pose），
-    // 供当前帧的 searchByProjection / searchLocalPoints 使用。
-    // 当前帧跟踪结束后，将当前帧的临时地图点更新为下一帧的"上一帧"做准备：
-    //   1. 清空旧的 mlpTemporalPoints_（来自上上帧的过时数据）
-    //   2. 用当前帧的校正 pose（mCurrentFrame_->pose）创建新的临时地图点
-    //      这些点在下一帧开始时被 updateLastFrame() 使用
-    clearTemporalMapPoints();
-    if (mCurrentFrame_ && !mCurrentFrame_->pts_3d.empty() && !mCurrentFrame_->depth_valid.empty()) {
-        const double th_depth = config_.max_depth * 4.0;
-        const Pose& Tc = mCurrentFrame_->pose;
-
-        const cv::Mat& K = config_.K;
-        CameraParams cam = getCameraParams(K);
-
-        int n_points = 0;
-        const size_t n_kpts = std::min(mCurrentFrame_->pts_3d.size(),
-                                        mCurrentFrame_->depth_valid.size());
-        for (size_t i = 0; i < n_kpts; ++i) {
-            if (!mCurrentFrame_->depth_valid[i]) continue;
-            if (i < mvpCurrentMapPointIds_.size() && mvpCurrentMapPointIds_[i] >= 0) {
-                n_points++;
-                continue;
-            }
-
-            const auto& p3d_cam = mCurrentFrame_->pts_3d[i];
-            if (p3d_cam.norm() < 1e-6) continue;
-            if (p3d_cam.z() > th_depth && n_points > 100) break;
-
-            Eigen::Vector3d p3d_world = camToWorldPoint(p3d_cam, Tc);
-            cv::Mat desc;
-            if (i < static_cast<size_t>(mCurrentFrame_->descriptors.rows))
-                desc = mCurrentFrame_->descriptors.row(static_cast<int>(i));
-            int mp_id = createMapPoint(p3d_world, desc, mCurrentFrame_->id, static_cast<int>(i), 1,
-                                       /*permanent=*/false);
-            if (mp_id < 0) continue;  // 3D 点非法，createMapPoint 已拒绝
-            mlpTemporalPoints_.push_back(mp_id);
-            n_points++;
-        }
-    }
+    // 帧末不再重建临时地图点。这里原有一段"用当前帧 pose 重建 mlpTemporalPoints_"的代码，
+    // 但它只把 id 塞进 mlpTemporalPoints_，没有写回 mLastFrameMapPointIds_，
+    // 而 searchByProjection 是通过 mLastFrameMapPointIds_ 找上一帧地图点的 ——
+    // 于是这批点谁也找不到，纯属每帧白建一批、再被下一次 clearTemporalMapPoints() 销毁。
+    // 现在统一由下一帧开头的 updateLastFrame() 建（那条路径会正确写回 id）。
 
     return mCurrentFrame_->pose;
 }
@@ -1114,17 +1094,22 @@ Pose Tracking::initialize() {
 // 1. 用参考关键帧更新上一帧的 pose
 // 2. 为上一帧中没有关联地图点的深度特征点创建临时 VO 地图点（mlpTemporalPoints）
 //    这些点不参与局部建图，仅用于当前帧的纯跟踪
+//
+// 建点配额：原实现在循环里用 `th_depth = max_depth * 4.0`（=48m）做提前 break，
+// 那是把 ORB-SLAM3 的 ThDepth（基线的倍数）当成"米"来用；而 compute3DPoints()
+// 早就把 > max_depth 的点过滤掉了，所以那条 break 永远不触发，等于没有配额。
+// 现在改用 config_.max_new_map_points_per_kf 做真正的配额。
+//
+// R2：不再用速度预测覆盖上一帧的位姿。早先这里把 mLastFrame_->pose 换成
+// mVelocity_ * mLastFrame_->pose 再 updateWorldPoints() 重算世界点。上一帧的 pose
+// 是 poseOptimization 优化过的结果，是系统里最可信的位姿之一；用恒速模型外推去覆盖它，
+// 等于每帧都把优化结果丢掉一次，误差按帧累积。ORB-SLAM3 里被替换的是"参考关键帧位姿 ×
+// Tlr"算出的临时值，主体仍是已优化位姿；这里没有跨关键帧的相对量，直接保留即可。
 // ================================================================
 void Tracking::updateLastFrame() {
     if (!mLastFrame_) return;
 
-    // R2：不再用速度预测覆盖上一帧的位姿。
-    // 之前这里把 mLastFrame_->pose 替换成 mVelocity_ * mLastFrame_->pose，再
-    // updateWorldPoints() 重算世界点。上一帧的 pose 是 poseOptimization 优化过
-    // 的结果，是系统里最可信的位姿之一；用恒速模型外推去覆盖它，等于每帧都把
-    // 优化结果丢掉一次，误差按帧累积（drift 计划里的主要来源之一）。
-    // ORB-SLAM3 里被替换的是"参考关键帧位姿 × Tlr"得到的临时值，主体仍是已优化
-    // 位姿；这里没有跨关键帧的相对量，直接保留 mLastFrame_->pose 即可。
+    // R2：不再用速度预测覆盖上一帧的位姿（理由见函数头注释）。
     // 下面只保留临时 VO 地图点的创建。
 
     // Step 2: 为上一帧中没有关联地图点的深度特征点创建临时 VO 地图点
@@ -1137,10 +1122,7 @@ void Tracking::updateLastFrame() {
     CameraParams cam = getCameraParams(K);
     double fx = cam.fx, fy = cam.fy, cx = cam.cx, cy = cam.cy;
 
-    // ★★★ 临时地图点（ORB-SLAM3 mlpTemporalPoints）★★★
-    // 这些点是纯跟踪产生的未确认地图点，仅供当前帧使用，不参与局部建图
-    // 在每帧跟踪开始时通过 clearTemporalPoints() 清空
-    const double th_depth = config_.max_depth * 4.0;  // ORB-SLAM3 mThDepth
+    const int max_points = config_.max_new_map_points_per_kf;
 
     int n_points = 0;
     const size_t n_kpts = std::min(mLastFrame_->pts_3d.size(),
@@ -1163,8 +1145,7 @@ void Tracking::updateLastFrame() {
         const auto& p3d_cam = mLastFrame_->pts_3d[i];
         if (p3d_cam.norm() < 1e-6) continue;
 
-        // 深度阈值：ORB-SLAM3 mThDepth（通常 = 4 * baseline）
-        if (p3d_cam.z() > th_depth && n_points > 100) break;
+        if (n_points >= max_points) break;
 
         // 相机坐标系 → 世界坐标系
         Eigen::Vector3d p3d_world = camToWorldPoint(p3d_cam, last_frame_pose);
@@ -1429,8 +1410,12 @@ int Tracking::trackReferenceKeyFrame() {
                 mbVelocityValid_ = false;
             }
         }
-
-        mLastFrame_->pose = mCurrentFrame_->pose;
+        // 这里原有一行 `mLastFrame_->pose = mCurrentFrame_->pose;`，已删除。
+        // 它的后果是：下一帧 updateLastFrame() 用"当前帧的 pose"给"上一帧的深度图"建
+        // 临时地图点，等于把上一帧的点云整体挪了一个帧间位移；updateMotionModel() 用
+        // (curr - last) 求速度时 last 已经被改成 curr，速度恒为 0，运动模型彻底失效；
+        // 帧间跳变守卫比较的也是同一个位姿，自比自永远不超限。
+        // 上一帧位姿只允许由 track() 末尾的 mLastFrame_ = mCurrentFrame_ 推进，别处不得改写。
     } else {
         mbVelocityValid_ = false;
     }
@@ -1444,18 +1429,10 @@ int Tracking::trackReferenceKeyFrame() {
 
     updateWorldPoints(mCurrentFrame_);
 
-    // ★★★ Bug Fix: 不要在 trackReferenceKeyFrame 中更新运动模型 ★★★
-    // trackReferenceKeyFrame 的 Δ = T(curr) ⊕ T(ref_kf) 混合了 refKF 之间的所有运动。
-    // 用它更新 mVelocity_ 会污染运动模型：
-    //   Frame 7: refKF delta = 0.589 rad → mVelocity_ 被设置为大的旋转增量
-    //   Frame 8: 用这个 mVelocity_ 预测 → 预测错误但 poseOpt 仍收敛 → nGood=269
-    //   Frame 9: 继续用 Frame 8 的 mVelocity_ → 预测更错 → nmatches=138 → poseOpt 失败
-    // 修复：不更新 mVelocity_，只保留 mLastFrame_ 的运动模型（由 poseOpt 更新）。
-    // 调用 updateMotionModel() 的正确位置：
-    //   1. trackWithMotionModel() 成功后（只调用一次）
-    //   2. SBP_FALLBACK 成功后（只调用一次）
-    //   3. RELOC 成功后（在主循环中）
-    // 不应该在 trackReferenceKeyFrame() / trackReferenceKeyFrame() 成功后调用。
+    // 关于运动模型：上面那段 mVelocity_ 用的是真实的帧间差 (curr ⊖ mLastFrame_)，语义正确，
+    // 保留。不要在这里调用 updateMotionModel() —— 那个函数假定"上一帧位姿未被改写"，
+    // 并且会在位移超过 0.15m/帧时直接放弃更新。也不必在此改写 mLastFrame_->pose：
+    // 上一帧位姿由 track() 末尾统一推进。
 
     return nGood;
 }
@@ -1627,17 +1604,24 @@ int Tracking::searchByProjection(Frame& CurrentFrame, const Frame& LastFrame,
             if (best_k < static_cast<int>(mvpCurrentMapPointIds_.size())) {
                 if (mvpCurrentMapPointIds_[best_k] >= 0) {
                     // 已有地图点（如 TrackRefKF 建立），不覆盖
-                } else if (i < mLastFrameMapPointIds_.size() && mLastFrameMapPointIds_[i] >= 0) {
-                    // 上一帧 keypoint i 已有地图点，复用它（对应 ORB-SLAM3 的隐式复用）
-                    mvpCurrentMapPointIds_[best_k] = mLastFrameMapPointIds_[i];
                 } else {
-                    // 创建新地图点
-                    cv::Mat desc;
-                    if (best_k < CurrentFrame.descriptors.rows)
-                        desc = CurrentFrame.descriptors.row(best_k);
-                    int mp_id = createMapPoint(p3d_world, desc, CurrentFrame.id, best_k, 1);
-                    if (mp_id < 0) continue;  // 3D 点非法，createMapPoint 已拒绝
-                    mvpCurrentMapPointIds_[best_k] = mp_id;
+                    const int reused_id =
+                        (i < mLastFrameMapPointIds_.size()) ? mLastFrameMapPointIds_[i] : -1;
+                    // 复用前必须确认 id 还活着：临时地图点只活一帧，悬空 id 一旦被搬进
+                    // mvpCurrentMapPointIds_，poseOptimization 取到 nullptr，那帧就只能靠
+                    // 极少数永久点求位姿（内点 900→0~20 的直接原因之一）。
+                    if (reused_id >= 0 && getMapPoint(reused_id) != nullptr) {
+                        // 上一帧 keypoint i 的地图点仍然有效，复用它（对应 ORB-SLAM3 的隐式复用）
+                        mvpCurrentMapPointIds_[best_k] = reused_id;
+                    } else {
+                        // 创建新地图点
+                        cv::Mat desc;
+                        if (best_k < CurrentFrame.descriptors.rows)
+                            desc = CurrentFrame.descriptors.row(best_k);
+                        int mp_id = createMapPoint(p3d_world, desc, CurrentFrame.id, best_k, 1);
+                        if (mp_id < 0) continue;  // 3D 点非法，createMapPoint 已拒绝
+                        mvpCurrentMapPointIds_[best_k] = mp_id;
+                    }
                 }
             }
         }
@@ -2334,26 +2318,34 @@ void Tracking::searchLocalPoints() {
     // 提高到 200（与 ORB-SLAM3 一致），确保只有在局部关键帧真正不充足时才触发全局搜索。
     bool use_local_only = (candidate_ids.size() >= 200);
     if (!use_local_only) {
-        // ★★★ Bug Fix: 添加距离过滤 + 数量限制 ★★★
-        // 原问题：全局搜索遍历所有 mAllMapPoints_（无边界增长），导致
-        // (1) 性能退化（O(N) per frame）；(2) 匹配到远处/坏点。
-        // 修复：计算每个全局地图点到相机的距离，只接受合理范围内的点，
-        // 并限制最多补充 500 个点。
-        Eigen::Vector3d cam_pos = mCurrentFrame_->pose.t;
-        const double max_dist = config_.max_depth * 4.0;
-        const int max_global_add = 500;
-        int global_added = 0;
-        for (auto& kv : mAllMapPoints_) {
-            if (global_added >= max_global_add) break;
-            int mp_id = kv.first;
-            if (sAlreadyFound.count(mp_id)) continue;
-            const auto& mp = kv.second;
-            if (mp.is_bad) continue;
-            double dist = (mp.world_point - cam_pos).norm();
+        // 局部关键帧的点不够用，从全图补充。
+        // 原实现直接遍历 mAllMapPoints_（unordered_map，哈希序）取前 500 个，
+        // 注释写着"只接受合理范围内的点"，实际是"随机抽 500 个点" ——
+        // 哈希序和"离相机近"没有任何关系。现在先按距离收集，再取最近的 500 个。
+        const Eigen::Vector3d cam_pos = mCurrentFrame_->pose.t;
+        // max_depth 本身就是"这个深度传感器还相信的极限"，不需要再乘 4。
+        const double max_dist = config_.max_depth;
+        struct NearbyCandidate {
+            double dist;
+            int id;
+        };
+        std::vector<NearbyCandidate> nearby;
+        for (const auto& kv : mAllMapPoints_) {
+            if (kv.second.is_bad) continue;
+            if (sAlreadyFound.count(kv.first) != 0) continue;
+            const double dist = (kv.second.world_point - cam_pos).norm();
             if (dist > max_dist) continue;
-            candidate_ids.push_back(mp_id);
-            global_added++;
+            nearby.push_back(NearbyCandidate{dist, kv.first});
         }
+        const size_t max_global_add = 500;
+        if (nearby.size() > max_global_add) {
+            std::partial_sort(nearby.begin(), nearby.begin() + max_global_add, nearby.end(),
+                              [](const NearbyCandidate& a, const NearbyCandidate& b) {
+                                  return a.dist < b.dist;
+                              });
+            nearby.resize(max_global_add);
+        }
+        for (const auto& c : nearby) candidate_ids.push_back(c.id);
     }
 
     const auto& curr_kpts = (!mCurrentFrame_->undistorted_keypoints.empty())
@@ -2573,9 +2565,10 @@ int Tracking::poseOptimization() {
     vSE3->setMarginalized(false);
     optimizer.addVertex(vSE3);
 
-    // Huber 核参数：deltaMono=5.0（约5px拐点），过滤 >5px 的中度误差
-    // 5.0 对应 ~2.24 sigma（2.24²≈5），与 ORB-SLAM3 标准 deltaMono≈2.45 接近。
-    const float deltaMono = 5.0f;
+    // Huber 核的拐点。取 config_.pnp_huber_delta（默认 2.45，= sqrt(5.991)），
+    // 与 ORB_SLAM3 Optimizer.cc 的 deltaMono 一致。此前这里硬编码 5.0，
+    // 于是 tracking.yaml 里的 pnp_huber_delta 谁都改不动 —— 又一个"配了不生效"（R-019）。
+    const float deltaMono = static_cast<float>(config_.pnp_huber_delta);
     const int nIters[4] = {10, 10, 10, 10};  // 4 轮，每轮 10 次迭代
 
     // 添加所有边（地图点对应）
@@ -2971,123 +2964,93 @@ void Tracking::updateMotionModel() {
 }
 
 // ================================================================
-// 关键帧判定（ORB-SLAM3 风格）
+// 关键帧判定（薄适配层）
 // ================================================================
+// 判定本身的唯一事实来源是 frontend/keyframe_policy.hpp 的 decideKeyframe()。
+// 这个函数只负责两件事：把 Tracking 的内部状态整理成 KeyframeEvidence，
+// 再把 TrackingConfig 里的阈值搬进 KeyframePolicyParams。
+//
+// 原先这里是一段 116 行的条件堆砌（c1a/c1b/c1c/c2/c1d/c1e 用 || 串起来），
+// 其中三个毛病直接导致了"640 帧插 562 个关键帧"：
+//   * c1b = (帧间隔 >= 10)，无条件的 —— 每 10 帧必插，与跟踪质量无关；
+//   * c1c = (内点数 < max(10, 参考点*0.25) || 近距离点太少)，没有任何帧间隔下限，
+//     而近距离判据又基于 `th_depth = max_depth*4.0`（=48m）—— 全部点都算"近"，
+//     bNeedToInsertClose 于是长期为真，c1c 几乎每帧成立；
+//   * local_mapping_busy 恒为 false（isBusy 调用被注释掉），那段"忙碌时只允许
+//     紧急插帧"的分支是死代码，等于没有任何限流。
+namespace {
+
+// 两帧位姿之间的旋转夹角（rad）。
+double rotationAngleBetween(const Eigen::Quaterniond& q_from, const Eigen::Quaterniond& q_to) {
+    Eigen::Quaterniond dq = q_to * q_from.inverse();
+    dq.normalize();
+    return 2.0 * std::atan2(dq.vec().norm(), std::abs(dq.w()));
+}
+
+// 判定结果的可读标签，只用于诊断日志。
+const char* keyframeDecisionReason(const KeyframeDecision& d) {
+    if (d.forced) return "forced";
+    if (d.rescue) return "rescue";
+    if (d.by_tracking_quality) return "quality";
+    if (d.by_motion) return "motion";
+    return "none";
+}
+
+}  // namespace
+
+// 证据 2 的取法有讲究：必须遍历参考关键帧**自己的** map_point_ids。
+// 原实现用 ref_kf.pts_3d 的长度当循环上界，却拿同一个下标去索引
+// mLastFrameMapPointIds_ —— 只有"参考帧恰好就是上一帧"时两者才是同一批特征点，
+// 一旦走 REF_KF / RELOC 路径，nRefMatches 就是个随机数。
+// 证据 3 用"相对关键帧"而不是"相对上一帧"：min_keyframe_translation 的语义
+// 就是关键帧之间的最小基线，拿帧间位移会让抖动本身也被算成"走了很远"。
 bool Tracking::needNewKeyFrame() {
-    // ★★★ ORB-SLAM3: 使用参考关键帧中实际被跟踪的地图点数量作为基准 ★★★
-    // 原问题：nRefMatches = mnMatchesInliers_，当跟踪质量差时这个值很小，
-    // 导致 c2 条件几乎不触发，关键帧创建不足。
-    // 正确做法：nRefMatches = 参考关键帧中被跟踪的地图点数量（与当前帧跟踪质量无关），
-    // 这样 c2 能准确反映"当前帧的跟踪质量相对于参考关键帧的下降程度"。
-    const int nKFs = static_cast<int>(mvpLocalKeyFrames_.size());
-    const int nMinObs = 3;
-    int nRefMatches = 0;
-    if (!mvpLocalKeyFrames_.empty()) {
-        const KeyFrameCacheEntry& ref_kf = mvpLocalKeyFrames_.back();
-        for (size_t i = 0; i < ref_kf.pts_3d.size(); ++i) {
-            if (!ref_kf.depth_valid[i]) continue;
-            if (i >= mLastFrameMapPointIds_.size()) continue;
-            int mp_id = mLastFrameMapPointIds_[i];
-            if (mp_id < 0) continue;
-            auto* mp = getMapPoint(mp_id);
-            if (mp && !mp->is_bad && mp->frontend_observation_count >= nMinObs)
-                nRefMatches++;
+    if (!mCurrentFrame_) return false;
+
+    const int frame_gap = mCurrentFrame_->id - mnLastKeyFrameId_;
+    const KeyFrameCacheEntry* ref_kf =
+        mvpLocalKeyFrames_.empty() ? nullptr : &mvpLocalKeyFrames_.back();
+
+    int ref_matches = 0;
+    double trans_since_kf = 0.0;
+    double rot_since_kf = 0.0;
+    if (ref_kf != nullptr) {
+        for (const int mp_id : ref_kf->map_point_ids) {
+            const MapPointCandidate* mp = (mp_id < 0) ? nullptr : getMapPoint(mp_id);
+            if (mp != nullptr && !mp->is_bad) ++ref_matches;
         }
+        trans_since_kf = (mCurrentFrame_->pose.t - ref_kf->world_pose.t).norm();
+        rot_since_kf = rotationAngleBetween(ref_kf->world_pose.q, mCurrentFrame_->pose.q);
     }
 
-    // ORB-SLAM3: thRefRatio 根据已有关键帧数量动态调整
-    float thRefRatio = 0.75f;
-    if (nKFs <= 2) thRefRatio = 0.4f;
+    KeyframePolicyParams params;
+    params.min_gap_frames = config_.min_keyframe_gap_frames;
+    params.forced_interval = config_.forced_keyframe_interval;
+    params.min_tracked_inliers = config_.keyframe_min_tracked_inliers;
+    params.weak_tracked_ratio = config_.keyframe_weak_tracked_ratio;
+    params.keyframe_translation = config_.min_keyframe_translation;
+    params.keyframe_rotation = config_.min_keyframe_rotation;
+    params.rescue_min_inliers = config_.keyframe_rescue_min_inliers;
+    params.rescue_max_gap = config_.keyframe_rescue_max_gap;
 
-    // ORB-SLAM3: nTrackedClose / nNonTrackedClose（RGB-D 特有）
-    // 统计当前帧深度范围内的有效地图点
-    int nTrackedClose = 0;
-    int nNonTrackedClose = 0;
-    const double th_depth = config_.max_depth * 4.0;
-    for (size_t i = 0; i < mvpCurrentMapPointIds_.size(); ++i) {
-        int mp_id = mvpCurrentMapPointIds_[i];
-        // 检查是否在深度范围内（通过 pts_3d 的 z 值近似判断）
-        if (i < mCurrentFrame_->pts_3d.size() && mCurrentFrame_->depth_valid[i]) {
-            double z = mCurrentFrame_->pts_3d[i].z();
-            if (z > 0 && z < th_depth) {
-                if (mp_id >= 0) nTrackedClose++;
-                else nNonTrackedClose++;
-            }
-        }
-    }
-    bool bNeedToInsertClose = (nTrackedClose < 100) && (nNonTrackedClose > 70);
+    KeyframeEvidence evidence;
+    evidence.frame_gap = frame_gap;
+    evidence.inliers = mnMatchesInliers_;
+    evidence.ref_matches = ref_matches;
+    evidence.velocity_valid = mbVelocityValid_;
+    evidence.translation_since_kf = trans_since_kf;
+    evidence.rotation_since_kf = rot_since_kf;
 
-    // ★★★ ORB-SLAM3 增强条件 ★★★
-    // Condition 1: 超过最大帧间隔没创建关键帧
-    const bool c1a = (mCurrentFrame_->id - mnLastKeyFrameId_) >= config_.forced_keyframe_interval;
+    const KeyframeDecision decision = decideKeyframe(params, evidence);
 
-    // Condition 2: LocalMapping 超过最小帧间隔
-    bool c1b = ((mCurrentFrame_->id - mnLastKeyFrameId_) >= 10);
-    // 注意：SFC-SLAM 的 LocalMapping 没有 AcceptKeyFrames 方法，
-    // 简化处理：直接使用帧间隔判断
-
-    // Condition 3: 跟踪质量严重下降（需要插入关键帧来恢复）
-    const bool c1c = (mnMatchesInliers_ < std::max(10, static_cast<int>(nRefMatches * 0.25)) || bNeedToInsertClose);
-
-    // Condition 4: 相对参考关键帧匹配内点显著下降
-    const bool c2 = ((mnMatchesInliers_ < std::max(15, static_cast<int>(nRefMatches * thRefRatio)) || bNeedToInsertClose)
-                     && mnMatchesInliers_ > 15);
-
-    // ★★★ 增强：运动距离条件（ORB-SLAM3 风格）★★★
-    // 当相机有较大位移时，即使跟踪质量好也创建关键帧以捕获新区域
-    bool c1d = false;
-    if (mbVelocityValid_ && mLastFrame_) {
-        double trans_delta = (mCurrentFrame_->pose.t - mLastFrame_->pose.t).norm();
-        // 平移超过阈值（相对于场景尺度）
-        // ★★★ Bug Fix: 修正关键帧阈值（原来是 *10，错误！）★★★
-        // 640帧约20秒，桌2场景约1m/s，最大1.5m/s
-        // 关键帧间隔应控制在0.3-0.5m（10-15帧），阈值设为0.2m
-        if (trans_delta > config_.min_keyframe_translation) {
-            c1d = true;
-        }
+    if (config_.verbose_diag && decision.need_keyframe) {
+        std::cerr << "[NeedKF] f=" << mCurrentFrame_->id << " gap=" << evidence.frame_gap
+                  << " inliers=" << evidence.inliers << "/" << evidence.ref_matches
+                  << " d_t=" << trans_since_kf << " d_r=" << rot_since_kf
+                  << " why=" << keyframeDecisionReason(decision) << std::endl;
     }
 
-    // ★★★ 增强：低内点 + 重建条件 ★★★
-    // 当跟踪内点少但有很多未匹配特征时，创建关键帧进行三角化
-    int nTotalFeatures = static_cast<int>(mCurrentFrame_->keypoints.size());
-    int nUnmatched = nTotalFeatures - mnMatchesInliers_;
-    bool c1e = (mnMatchesInliers_ < config_.c1e_min_inliers) && (nUnmatched > config_.c1e_min_unmatched) &&
-                ((mCurrentFrame_->id - mnLastKeyFrameId_) >= 5);
-
-    // ★★★ Bug Fix: 检查 LocalMapping 是否可以接受新关键帧 ★★★
-    // 如果 LocalMapping 正在处理中（忙碌状态），减少关键帧创建以避免堆积
-    bool local_mapping_busy = false;
-    if (mpLocalMapper_) {
-        // 注意：SFC-SLAM 的 LocalMapping 可能没有 isStopped 方法
-        // 这里使用简化检查：检查处理队列大小
-        // 如果需要，可以添加更完善的 LocalMapping 状态检查
-        // local_mapping_busy = mpLocalMapper_->isBusy();
-    }
-    
-    // 当 LocalMapping 忙碌时，只有在跟踪质量严重下降时才创建关键帧
-    if (local_mapping_busy) {
-        bool need_kf = c1c || c2;  // 只在紧急情况下创建
-        if (config_.verbose_diag && need_kf) {
-            std::cerr << "[NeedKF] f=" << mCurrentFrame_->id
-                      << " LOCAL_MAPPING_BUSY - inliers=" << mnMatchesInliers_ << "/" << nRefMatches
-                      << " c1c=" << c1c << " c2=" << c2 << std::endl;
-        }
-        return need_kf;
-    }
-
-    bool need_kf = (c1a || c1b || c1c || c2 || c1d || c1e);
-
-    if (config_.verbose_diag && need_kf) {
-        std::cerr << "[NeedKF] f=" << mCurrentFrame_->id
-                  << " inliers=" << mnMatchesInliers_ << "/" << nRefMatches
-                  << " thRatio=" << thRefRatio
-                  << " close=" << nTrackedClose << "/" << nNonTrackedClose
-                  << " c1a=" << c1a << " c1b=" << c1b << " c1c=" << c1c
-                  << " c1d=" << c1d << " c1e=" << c1e << " c2=" << c2
-                  << std::endl;
-    }
-
-    return need_kf;
+    return decision.need_keyframe;
 }
 
 // ================================================================
@@ -3123,7 +3086,11 @@ void Tracking::createNewKeyFrame() {
     }
 
     mvpLocalKeyFrames_.push_back(new_kf);
-    while (mvpLocalKeyFrames_.size() > 20)
+    // 局部关键帧窗口（可配置，默认 40）。原值 20 太小：关键帧一密，窗口里只剩下
+    // 时间上相邻、几乎没有视差的帧，searchLocalPoints 拿不到有横向约束的点。
+    const int window =
+        std::max(1, config_.local_map_keyframe_window);
+    while (mvpLocalKeyFrames_.size() > static_cast<size_t>(window))
         mvpLocalKeyFrames_.pop_front();
 
     // ★★★ 同时保存到全局关键帧缓存（用于 BoW 重定位候选搜索）★★★
@@ -3168,7 +3135,6 @@ void Tracking::createNewKeyFrame() {
     // 对深度有效且没有关联地图点的点，用深度直接三角化（UnprojectStereo）创建新地图点。
     // ================================================================
     {
-        const double th_depth = config_.max_depth * 4.0;  // ORB-SLAM3 mThDepth
         const cv::Mat& K = config_.K;
         CameraParams cam = getCameraParams(K);
         double fx = cam.fx, fy = cam.fy, cx = cam.cx, cy = cam.cy;
@@ -3188,15 +3154,13 @@ void Tracking::createNewKeyFrame() {
             sort(vDepthIdx.begin(), vDepthIdx.end());
 
             int n_points = 0;
-            // ★★★ Bug Fix P2: 限制每帧创建地图点的上限 ★★★
-            // 原问题：每帧最多可创建 ~2000 个地图点（所有有效深度特征点），
-            // 加上频繁的关键帧创建，导致 mAllMapPts 快速增长到 100万+，
-            // 大量低质量地图点堆积，严重拖慢 searchLocalPoints() 和 poseOptimization()。
-            // 修复：每帧只保留深度最近的 100 个点（ORB-SLAM3 标准策略），
-            // 其余特征点不创建地图点，在 TrackMM 中通过 searchByProjection 临时使用。
-            const int MAX_POINTS_PER_FRAME = 100;
+            // 每个关键帧最多新建的地图点数（可配置，默认 300）。
+            // 原值硬编码 100：vDepthIdx 已按深度升序排好，配额一满就直接截断，
+            // 远处的强结构点（墙面/桌沿）永远拿不到名额，视野边缘长期没有 3D 点。
+            // 上限本身是必要的（否则每帧能建 ~2000 个点，地图膨胀到百万级）。
+            const int max_points = std::max(1, config_.max_new_map_points_per_kf);
             for (const auto& dp : vDepthIdx) {
-                if (n_points >= MAX_POINTS_PER_FRAME) break;
+                if (n_points >= max_points) break;
                 size_t i = dp.second;
 
                 // 已有地图点的特征点跳过；命中坏点则清槽位重建（否则坏点永久占位）
@@ -3209,9 +3173,7 @@ void Tracking::createNewKeyFrame() {
                     mvpCurrentMapPointIds_[i] = -1;
                 }
 
-                // 深度超过阈值且已有足够多近点：停止
-                double z = mCurrentFrame_->pts_3d[i].z();
-                if (z > th_depth && n_points > 100) break;
+                // 深度已经按升序遍历，剩下的点只会更远；配额在循环开头已经检查过。
 
                 // 用深度图反投影得到相机坐标系 3D 点
                 const auto& p3d_cam = mCurrentFrame_->pts_3d[i];
@@ -3361,7 +3323,7 @@ void Tracking::triangulateNewMapPoints() {
 // R5 重写：只处理"观察期内的新点"（mNewMapPointIds_），不再每建一个关键帧
 // 就 O(N) 扫全图。判定规则：
 //   1. 已被别的帧匹配到（frontend_observation_count >= 2）→ 确认，移出观察期
-//   2. 观察期已过（建点帧到当前帧 >= kMapPointObservationGraceFrames）且仍只有
+//   2. 观察期已过（建点帧到当前帧 >= config_.map_point_grace_frames）且仍只有
 //      1 次观测 → 标 is_bad（这就是"单次观测质量过低"的原意）
 //   3. 观察期未过 → 继续留在观察期，下一轮再看
 // 旧实现的问题在于新建点在同一轮 createNewKeyFrame 里就被判坏：它们当然
@@ -3381,7 +3343,12 @@ void Tracking::cleanOldMapPoints() {
         if (cand.frontend_observation_count >= 2) continue;  // 已确认，移出观察期
         const int age = (cand.created_frame_id >= 0 && current_frame_id >= 0)
                       ? (current_frame_id - cand.created_frame_id) : 0;
-        if (age < kMapPointObservationGraceFrames) {
+        // 观察期长度来自 config_.map_point_grace_frames（默认 8 帧）。
+        // 原来是硬编码常量 3：关键帧建点时 obs_count=1，只有 3 帧时间去等第二次观测，
+        // 而 3 帧内 searchLocalPoints 往往还没轮到它 —— 于是整批新点刚建好就被判死，
+        // 地图永远长不起来，跟踪只能靠越来越少的旧点。
+        const int grace = std::max(1, config_.map_point_grace_frames);
+        if (age < grace) {
             mNewMapPointIds_[keep++] = id;  // 仍在观察期
             continue;
         }

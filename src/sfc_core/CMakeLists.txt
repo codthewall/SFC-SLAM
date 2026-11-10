@@ -138,6 +138,7 @@ add_library(${PROJECT_NAME} SHARED
   src/frontend/covis_core.cpp
   src/frontend/covis_manager.cpp
   src/frontend/tracking.cpp
+  src/frontend/keyframe_policy.cpp
   src/frontend/frame.cpp
   src/frontend/sophus_pose_adapter.cpp
   src/feature/bow_adapter.cpp
@@ -177,6 +178,19 @@ target_link_libraries(test_loop_detector
   g2o::core g2o::types_sba g2o::types_slam3d g2o::solver_dense g2o::stuff
 )
 target_compile_options(test_loop_detector PRIVATE -Usfc_core)
+
+# 测试可执行程序：关键帧策略纯逻辑单测（纯逻辑，不需要相机数据与 g2o）
+add_executable(test_keyframe_policy
+  test/test_keyframe_policy.cpp
+)
+target_link_libraries(test_keyframe_policy
+  ${PROJECT_NAME}
+  ${OpenCV_LIBS}
+)
+target_compile_options(test_keyframe_policy PRIVATE -Usfc_core)
+install(TARGETS test_keyframe_policy
+  DESTINATION lib/${PROJECT_NAME}
+)
 
 # 测试可执行程序：TUM-RGBD 分模块诊断
 add_executable(test_tum_module_diag
