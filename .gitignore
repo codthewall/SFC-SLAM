@@ -43,3 +43,6 @@ __pycache__/
 *.swp
 .DS_Store
 Thumbs.db
+
+# 本地临时提交信息文件，不入库
+.git-commit-msg.tmp
